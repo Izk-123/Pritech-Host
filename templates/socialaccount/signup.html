@@ -1,0 +1,176 @@
+{% extends 'base.html' %}
+{% load static %}
+
+{% block react_code %}
+
+<!-- 1. Inject Django variables safely OUTSIDE the verbatim block -->
+<script>
+    window.PRITECH_LOGO_URL = "{% static 'images/pritech-logo.svg' %}";
+    window.CSRF_TOKEN = "{{ csrf_token }}";
+    window.FORM_ACTION = "{{ request.path }}";
+    window.PROVIDER_NAME = "{{ provider.name|default:'Google' }}";
+    
+    // Safely escape the email to prevent JS injection crashes
+    window.INITIAL_EMAIL = "{{ form.email.value|default:''|escapejs }}";
+
+    // Pass redirect hidden fields if they exist
+    window.REDIRECT_FIELD_NAME = "{{ redirect_field_name|default:'' }}";
+    window.REDIRECT_FIELD_VALUE = "{{ redirect_field_value|default:'' }}";
+
+    // 1a. Inject Django System Messages (e.g., from failed redirects)
+    window.DJANGO_MESSAGES = [
+        {% for message in messages %}
+        {
+            "tags": "{{ message.tags }}",
+            "message": "{{ message|escapejs }}"
+        }{% if not forloop.last %},{% endif %}
+        {% endfor %}
+    ];
+
+    // 1b. Inject Form Validation Errors (The "Account already exists" message goes here)
+    window.FORM_ERRORS = {{ form.errors.as_json|safe|default:"{}" }};
+</script>
+
+<!-- 2. React Code (Protected by verbatim) -->
+{% verbatim %}
+<script type="text/babel">
+    const hasMotion = !!window.Motion;
+    const motion = hasMotion ? window.Motion.motion : {
+        div: (props) => <div {...props} />,
+    };
+    const AnimatePresence = hasMotion ? window.Motion.AnimatePresence : ({ children }) => <>{children}</>;
+
+    const LOGO_URL = window.PRITECH_LOGO_URL;
+    const CSRF_TOKEN = window.CSRF_TOKEN;
+    const FORM_ACTION = window.FORM_ACTION;
+    const PROVIDER_NAME = window.PROVIDER_NAME;
+    const INITIAL_EMAIL = window.INITIAL_EMAIL;
+    const REDIRECT_FIELD_NAME = window.REDIRECT_FIELD_NAME;
+    const REDIRECT_FIELD_VALUE = window.REDIRECT_FIELD_VALUE;
+    
+    // Parse errors
+    const djangoMessages = window.DJANGO_MESSAGES || [];
+    const formErrors = window.FORM_ERRORS || {};
+
+    function SocialSignupPage() {
+        // Extract specific errors for display
+        const nonFieldErrors = formErrors.__all__ ? formErrors.__all__.map(e => e.message) : [];
+        const emailErrors = formErrors.email ? formErrors.email.map(e => e.message) : [];
+        
+        // Map Django message tags to Tailwind colors
+        const getMessageStyle = (tags) => {
+            if (tags.includes('error')) return 'bg-red-50 text-red-700 border-red-200';
+            if (tags.includes('warning')) return 'bg-yellow-50 text-yellow-700 border-yellow-200';
+            if (tags.includes('success')) return 'bg-green-50 text-green-700 border-green-200';
+            return 'bg-blue-50 text-blue-700 border-blue-200';
+        };
+
+        return (
+            <div className="min-h-screen bg-bg flex flex-col font-sans text-text">
+                <header className="bg-white border-b border-border px-4 py-4">
+                    <div className="max-w-[1100px] mx-auto flex items-center">
+                        <img src={LOGO_URL} alt="Pritech Host" className="h-[34px] object-contain" />
+                    </div>
+                </header>
+
+                <main className="flex-grow flex items-center justify-center p-4">
+                    <motion.div 
+                        initial={hasMotion ? { opacity: 0, y: 20 } : {}} 
+                        animate={hasMotion ? { opacity: 1, y: 0 } : {}}
+                        className="bg-white border border-border rounded-[18px] p-8 w-full max-w-md flex flex-col gap-6 shadow-sm"
+                    >
+                        <div className="text-center">
+                            <h1 className="text-2xl font-heading font-bold text-navy mb-2">Almost there</h1>
+                            <p className="text-muted text-sm">
+                                You are about to use your <strong>{PROVIDER_NAME}</strong> account to login. As a final step, please complete the form below.
+                            </p>
+                        </div>
+
+                        {/* --- DJANGO SYSTEM MESSAGES BANNER --- */}
+                        <AnimatePresence>
+                            {djangoMessages.length > 0 && (
+                                <motion.div
+                                    initial={{ opacity: 0, height: 0, marginBottom: 0 }}
+                                    animate={{ opacity: 1, height: 'auto', marginBottom: 16 }}
+                                    exit={{ opacity: 0, height: 0, marginBottom: 0 }}
+                                    className="flex flex-col gap-2 overflow-hidden"
+                                >
+                                    {djangoMessages.map((msg, index) => (
+                                        <div key={index} className={`p-4 rounded-xl border text-sm font-medium flex items-start gap-3 ${getMessageStyle(msg.tags)}`}>
+                                            <svg className="w-5 h-5 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                                            </svg>
+                                            {msg.message}
+                                        </div>
+                                    ))}
+                                </motion.div>
+                            )}
+                        </AnimatePresence>
+
+                        {/* --- NON-FIELD ERRORS (The "Account already exists" message) --- */}
+                        <AnimatePresence>
+                            {nonFieldErrors.length > 0 && (
+                                <motion.div
+                                    initial={{ opacity: 0, height: 0 }}
+                                    animate={{ opacity: 1, height: 'auto' }}
+                                    exit={{ opacity: 0, height: 0 }}
+                                    className="bg-red-50 text-red-700 border border-red-200 p-4 rounded-xl text-sm font-medium flex flex-col gap-2"
+                                >
+                                    {nonFieldErrors.map((err, i) => (
+                                        <div key={i} className="flex items-start gap-2">
+                                            <svg className="w-5 h-5 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                                            </svg>
+                                            {/* dangerouslySetInnerHTML is used because Allauth often includes <a> tags in its error messages */}
+                                            <span dangerouslySetInnerHTML={{__html: err}} />
+                                        </div>
+                                    ))}
+                                </motion.div>
+                            )}
+                        </AnimatePresence>
+
+                        <form method="POST" action={FORM_ACTION} className="flex flex-col gap-4">
+                            <input type="hidden" name="csrfmiddlewaretoken" value={CSRF_TOKEN} />
+                            
+                            {/* Render redirect fields dynamically if they exist */}
+                            {REDIRECT_FIELD_NAME && REDIRECT_FIELD_VALUE && (
+                                <input type="hidden" name={REDIRECT_FIELD_NAME} value={REDIRECT_FIELD_VALUE} />
+                            )}
+
+                            <div className="flex flex-col gap-1.5">
+                                <label className="text-sm font-semibold text-navy">Email address</label>
+                                <input 
+                                    type="email" 
+                                    name="email" 
+                                    required 
+                                    className={`border rounded-lg p-3 focus:outline-none ${emailErrors.length > 0 ? 'border-red-500 bg-red-50 focus:border-red-500' : 'border-border bg-gray-50 text-muted focus:border-brand'}`} 
+                                    defaultValue={INITIAL_EMAIL} 
+                                    readOnly 
+                                />
+                                {/* Email Field Errors */}
+                                {emailErrors.length > 0 && (
+                                    <span className="text-xs text-red-600 font-medium">{emailErrors[0]}</span>
+                                )}
+                            </div>
+                            
+                            <button type="submit" className="w-full bg-brand text-white font-semibold py-3 rounded-xl hover:bg-brand-hover transition-colors mt-2">
+                                Continue
+                            </button>
+                        </form>
+
+                        <div className="text-center mt-2">
+                            <a href="/accounts/login/" className="text-sm text-brand font-semibold hover:underline">
+                                Cancel and return to login
+                            </a>
+                        </div>
+                    </motion.div>
+                </main>
+            </div>
+        );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<SocialSignupPage />);
+</script>
+{% endverbatim %}
+{% endblock %}

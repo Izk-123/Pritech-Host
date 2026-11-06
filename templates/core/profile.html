@@ -1,0 +1,212 @@
+{% extends 'base.html' %}
+{% load static %}
+
+{% block react_code %}
+<script>
+    window.PRITECH_LOGO_URL = "{% static 'images/pritech-logo.svg' %}";
+    window.LOGOUT_URL = "{% url 'account_logout' %}";
+    window.HOME_URL = "{% url 'core:home' %}";
+    window.DASHBOARD_URL = "{% url 'core:dashboard' %}";
+    window.CSRF_TOKEN = "{{ csrf_token }}";
+    
+    // Allauth URLs for advanced settings
+    window.ALLAUTH_EMAIL_URL = "{% url 'account_email' %}";
+    window.ALLAUTH_PASSWORD_URL = "{% url 'account_change_password' %}";
+    window.ALLAUTH_CONNECTIONS_URL = "{% url 'socialaccount_connections' %}";
+</script>
+
+{% verbatim %}
+<script type="text/babel">
+    const { useState, useEffect } = React;
+    const hasMotion = !!window.Motion;
+    const motion = hasMotion ? window.Motion.motion : { div: (props) => <div {...props} /> };
+
+    const LOGO_URL = window.PRITECH_LOGO_URL;
+    const CSRF_TOKEN = window.CSRF_TOKEN;
+
+    // --- Skeleton Loader ---
+    const Skeleton = ({ className }) => <div className={`animate-pulse bg-gray-200 rounded-lg ${className}`}></div>;
+
+    function ProfilePage() {
+        const [data, setData] = useState(null);
+        const [loading, setLoading] = useState(true);
+        const [saving, setSaving] = useState(false);
+        const [message, setMessage] = useState({ type: '', text: '' });
+
+        // Fetch initial data
+        useEffect(() => {
+            fetch('/api/profile-data/')
+                .then(res => res.json())
+                .then(d => { setData(d); setLoading(false); })
+                .catch(err => {
+                    console.error("Failed to load profile", err);
+                    setLoading(false);
+                });
+        }, []);
+
+        const handleChange = (section, field, value) => {
+            setData(prev => ({
+                ...prev,
+                [section]: {
+                    ...prev[section],
+                    [field]: value
+                }
+            }));
+        };
+
+        const handleSubmit = (e) => {
+            e.preventDefault();
+            setSaving(true);
+            setMessage({ type: '', text: '' });
+
+            fetch('/api/profile-data/', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-CSRFToken': CSRF_TOKEN },
+                body: JSON.stringify(data)
+            })
+            .then(res => res.json())
+            .then(d => {
+                if (d.success) {
+                    setMessage({ type: 'success', text: d.message });
+                    // Scroll to top to see message
+                    window.scrollTo({ top: 0, behavior: 'smooth' });
+                } else {
+                    setMessage({ type: 'error', text: 'Please correct the errors below.' });
+                }
+            })
+            .finally(() => setSaving(false));
+        };
+
+        if (loading) {
+            return (
+                <div className="h-screen bg-bg p-6 flex flex-col gap-6 items-center">
+                    <Skeleton className="w-full max-w-[800px] h-[50px]" />
+                    <Skeleton className="w-full max-w-[800px] h-[400px]" />
+                </div>
+            );
+        }
+
+        return (
+            <div className="min-h-screen bg-bg flex flex-col font-sans text-text pb-12">
+                {/* Header */}
+                <header className="bg-white border-b border-border px-4 py-4 mb-6">
+                    <div className="max-w-[800px] mx-auto flex items-center justify-between">
+                        <a href={window.DASHBOARD_URL}>
+                            <img src={LOGO_URL} alt="Pritech Host" className="h-[34px] object-contain" />
+                        </a>
+                        <a href={window.DASHBOARD_URL} className="text-sm font-semibold text-brand hover:underline flex items-center gap-2">
+                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10 19l-7-7m0 0l7-7m-7 7h18"></path></svg>
+                            Back to Dashboard
+                        </a>
+                    </div>
+                </header>
+
+                <main className="flex-grow max-w-[800px] mx-auto w-full px-4">
+                    <div className="mb-6">
+                        <h1 className="text-2xl font-heading font-bold text-navy">Account Settings</h1>
+                        <p className="text-muted text-sm mt-1">Manage your personal information and account security.</p>
+                    </div>
+
+                    {/* Success/Error Message */}
+                    {message.text && (
+                        <div className={`p-4 rounded-xl mb-6 text-sm font-medium border ${message.type === 'success' ? 'bg-green-50 text-green-700 border-green-200' : 'bg-red-50 text-red-700 border-red-200'}`}>
+                            {message.text}
+                        </div>
+                    )}
+
+                    <form onSubmit={handleSubmit} className="flex flex-col gap-6">
+                        
+                        {/* 1. Personal Details */}
+                        <div className="bg-white border border-border rounded-[18px] p-6 shadow-sm">
+                            <h2 className="text-lg font-heading font-bold text-navy mb-4 border-b pb-2">Personal Details</h2>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                <div className="flex flex-col gap-1.5">
+                                    <label className="text-sm font-semibold text-navy">First Name</label>
+                                    <input type="text" required value={data.user.first_name} onChange={e => handleChange('user', 'first_name', e.target.value)} className="border border-border rounded-lg p-3 focus:outline-none focus:border-brand" />
+                                </div>
+                                <div className="flex flex-col gap-1.5">
+                                    <label className="text-sm font-semibold text-navy">Last Name</label>
+                                    <input type="text" value={data.user.last_name} onChange={e => handleChange('user', 'last_name', e.target.value)} className="border border-border rounded-lg p-3 focus:outline-none focus:border-brand" />
+                                </div>
+                                <div className="flex flex-col gap-1.5">
+                                    <label className="text-sm font-semibold text-navy">Phone Number</label>
+                                    <input type="tel" value={data.user.phone_number} onChange={e => handleChange('user', 'phone_number', e.target.value)} className="border border-border rounded-lg p-3 focus:outline-none focus:border-brand" placeholder="+265 999 000 000" />
+                                </div>
+                                <div className="flex flex-col gap-1.5">
+                                    <label className="text-sm font-semibold text-navy">Date of Birth</label>
+                                    <input type="date" value={data.user.date_of_birth} onChange={e => handleChange('user', 'date_of_birth', e.target.value)} className="border border-border rounded-lg p-3 focus:outline-none focus:border-brand" />
+                                </div>
+                                <div className="flex flex-col gap-1.5 md:col-span-2">
+                                    <label className="text-sm font-semibold text-navy">Gender</label>
+                                    <div className="flex gap-4">
+                                        <label className="flex items-center gap-2 text-sm"><input type="radio" name="gender" value="M" checked={data.user.gender === 'M'} onChange={e => handleChange('user', 'gender', e.target.value)} /> Male</label>
+                                        <label className="flex items-center gap-2 text-sm"><input type="radio" name="gender" value="F" checked={data.user.gender === 'F'} onChange={e => handleChange('user', 'gender', e.target.value)} /> Female</label>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        {/* 2. Billing Details */}
+                        <div className="bg-white border border-border rounded-[18px] p-6 shadow-sm">
+                            <h2 className="text-lg font-heading font-bold text-navy mb-4 border-b pb-2">Billing Details</h2>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                <div className="flex flex-col gap-1.5">
+                                    <label className="text-sm font-semibold text-navy">Company Name</label>
+                                    <input type="text" value={data.profile.company_name} onChange={e => handleChange('profile', 'company_name', e.target.value)} className="border border-border rounded-lg p-3 focus:outline-none focus:border-brand" />
+                                </div>
+                                <div className="flex flex-col gap-1.5">
+                                    <label className="text-sm font-semibold text-navy">TIN / VAT Number</label>
+                                    <input type="text" value={data.profile.tin_vat} onChange={e => handleChange('profile', 'tin_vat', e.target.value)} className="border border-border rounded-lg p-3 focus:outline-none focus:border-brand" />
+                                </div>
+                                <div className="flex flex-col gap-1.5 md:col-span-2">
+                                    <label className="text-sm font-semibold text-navy">Physical Address</label>
+                                    <textarea rows="3" value={data.profile.address} onChange={e => handleChange('profile', 'address', e.target.value)} className="border border-border rounded-lg p-3 focus:outline-none focus:border-brand"></textarea>
+                                </div>
+                            </div>
+                        </div>
+
+                        {/* Save Button */}
+                        <div className="flex justify-end">
+                            <button type="submit" disabled={saving} className="bg-brand text-white font-semibold py-3 px-8 rounded-xl hover:bg-brand-hover transition-colors disabled:opacity-50">
+                                {saving ? 'Saving...' : 'Save Changes'}
+                            </button>
+                        </div>
+                    </form>
+
+                    {/* 3. Account Security (Allauth Managed) */}
+                    <div className="bg-white border border-border rounded-[18px] p-6 shadow-sm mt-6">
+                        <h2 className="text-lg font-heading font-bold text-navy mb-4 border-b pb-2">Account Security</h2>
+                        <div className="flex flex-col gap-3">
+                            <div className="flex justify-between items-center">
+                                <div>
+                                    <p className="font-semibold text-sm text-navy">Email Address</p>
+                                    <p className="text-sm text-muted">{data.user.email}</p>
+                                </div>
+                                <a href={window.ALLAUTH_EMAIL_URL} className="border border-border px-4 py-2 rounded-lg text-sm font-semibold hover:bg-gray-50 text-navy">Change</a>
+                            </div>
+                            <div className="flex justify-between items-center border-t pt-3">
+                                <div>
+                                    <p className="font-semibold text-sm text-navy">Password</p>
+                                    <p className="text-sm text-muted">••••••••</p>
+                                </div>
+                                <a href={window.ALLAUTH_PASSWORD_URL} className="border border-border px-4 py-2 rounded-lg text-sm font-semibold hover:bg-gray-50 text-navy">Change</a>
+                            </div>
+                            <div className="flex justify-between items-center border-t pt-3">
+                                <div>
+                                    <p className="font-semibold text-sm text-navy">Connected Accounts</p>
+                                    <p className="text-sm text-muted">Manage Google login</p>
+                                </div>
+                                <a href={window.ALLAUTH_CONNECTIONS_URL} className="border border-border px-4 py-2 rounded-lg text-sm font-semibold hover:bg-gray-50 text-navy">Manage</a>
+                            </div>
+                        </div>
+                    </div>
+                </main>
+            </div>
+        );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<ProfilePage />);
+</script>
+{% endverbatim %}
+{% endblock %}

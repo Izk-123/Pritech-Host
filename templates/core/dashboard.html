@@ -1,0 +1,378 @@
+{% extends 'base.html' %}
+{% load static %}
+
+{% block react_code %}
+<script>
+    window.PRITECH_LOGO_URL = "{% static 'images/pritech-logo.svg' %}";
+    window.LOGOUT_URL = "{% url 'account_logout' %}";
+    window.PROFILE_URL = "{% url 'core:profile' %}"; 
+    window.CSRF_TOKEN = "{{ csrf_token }}";
+</script>
+
+{% verbatim %}
+<script type="text/babel">
+    const { useState, useEffect } = React;
+
+    const hasMotion = !!window.Motion;
+    const motion = hasMotion ? window.Motion.motion : { div: (props) => <div {...props} /> };
+
+    const LOGO_URL = window.PRITECH_LOGO_URL;
+    const CSRF_TOKEN = window.CSRF_TOKEN;
+    const PROFILE_URL = window.PROFILE_URL;
+
+    const fmt = (num) => new Intl.NumberFormat('en-MW', { style: 'currency', currency: 'MWK', maximumFractionDigits: 0 }).format(num || 0);
+
+    // --- COMPONENTS ---
+    const Skeleton = ({ className }) => <div className={`animate-pulse bg-gray-200 rounded-lg ${className}`}></div>;
+
+    const Modal = ({ isOpen, onClose, title, children }) => {
+        if (!isOpen) return null;
+        return (
+            <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-navy/50 backdrop-blur-sm">
+                <motion.div initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} className="bg-white rounded-[18px] p-6 w-full max-w-md shadow-xl">
+                    <div className="flex justify-between items-center mb-4">
+                        <h2 className="text-xl font-heading font-bold text-navy">{title}</h2>
+                        <button onClick={onClose} className="text-muted hover:text-red-500 transition-colors">✕</button>
+                    </div>
+                    {children}
+                </motion.div>
+            </div>
+        );
+    };
+
+    const ProjectTimeline = ({ currentStage }) => {
+        const stages = [
+            { id: 'deposit', label: 'Deposit' }, { id: 'content', label: 'Content' },
+            { id: 'design', label: 'Design' }, { id: 'approval', label: 'Approval' },
+            { id: 'launch', label: 'Launch' }, { id: 'live', label: 'Live' },
+        ];
+        const currentIndex = stages.findIndex(s => s.id === currentStage);
+        
+        return (
+            <div className="bg-white border border-border rounded-[18px] p-6 shadow-sm mb-6">
+                <h2 className="text-lg font-heading font-bold text-navy mb-6">Project Progress</h2>
+                <div className="hidden md:flex justify-between items-center relative w-full">
+                    <div className="absolute top-3 left-0 w-full h-1 bg-border rounded -z-0"></div>
+                    <div className="absolute top-3 left-0 h-1 bg-brand rounded transition-all duration-500" style={{ width: `${(Math.max(0, currentIndex) / (stages.length - 1)) * 100}%` }}></div>
+                    {stages.map((stage, index) => {
+                        const isCompleted = index < currentIndex;
+                        const isActive = index === currentIndex;
+                        return (
+                            <div key={stage.id} className="flex flex-col items-center gap-2 relative z-10 bg-white px-2">
+                                <div className={`w-8 h-8 rounded-full flex items-center justify-center font-bold text-sm transition-colors ${isCompleted ? 'bg-brand text-white' : isActive ? 'bg-brand text-white ring-4 ring-brand-light' : 'bg-gray-200 text-gray-500'}`}>
+                                    {isCompleted ? '✓' : index + 1}
+                                </div>
+                                <span className={`text-xs font-semibold ${isCompleted || isActive ? 'text-navy' : 'text-muted'}`}>{stage.label}</span>
+                            </div>
+                        );
+                    })}
+                </div>
+                <div className="md:hidden flex flex-col gap-0 relative">
+                    {stages.map((stage, index) => {
+                        const isCompleted = index < currentIndex;
+                        const isActive = index === currentIndex;
+                        return (
+                            <div key={stage.id} className="flex items-center gap-4 relative">
+                                {index !== stages.length - 1 && <div className={`absolute left-4 top-8 w-0.5 h-full ${isCompleted ? 'bg-brand' : 'bg-border'}`}></div>}
+                                <div className={`w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 z-10 font-bold text-sm ${isCompleted ? 'bg-brand text-white' : isActive ? 'bg-brand text-white ring-4 ring-brand-light' : 'bg-gray-200 text-gray-500'}`}>
+                                    {isCompleted ? '✓' : index + 1}
+                                </div>
+                                <span className={`text-sm font-semibold py-4 ${isCompleted || isActive ? 'text-navy' : 'text-muted'}`}>{stage.label}</span>
+                            </div>
+                        );
+                    })}
+                </div>
+            </div>
+        );
+    };
+
+    // --- MAIN COMPONENT ---
+    function DashboardPage() {
+        const [data, setData] = useState(null);
+        const [loading, setLoading] = useState(true);
+        const [error, setError] = useState(null);
+        
+        const [isTicketOpen, setIsTicketOpen] = useState(false);
+        const [isPaying, setIsPaying] = useState(false);
+        const [ticketData, setTicketData] = useState({ subject: '', message: '' });
+
+        const queryParams = new URLSearchParams(window.location.search);
+        const paymentStatus = queryParams.get('payment');
+        const [showSuccessBanner, setShowSuccessBanner] = useState(paymentStatus === 'success');
+
+        const fetchData = () => {
+            fetch('/api/dashboard-data/')
+                .then(res => {
+                    if (!res.ok) throw new Error('Failed to load data');
+                    return res.json();
+                })
+                .then(d => { 
+                    setData(d); 
+                    setLoading(false); 
+                    if (showSuccessBanner && d.next_invoice === null) setShowSuccessBanner(false);
+                })
+                .catch(err => { 
+                    console.error(err); 
+                    setError("Could not load your dashboard. Please refresh the page.");
+                    setLoading(false); 
+                });
+        };
+
+        useEffect(() => {
+            fetchData();
+            if (paymentStatus === 'success') {
+                const timer = setTimeout(() => fetchData(), 3000);
+                return () => clearTimeout(timer);
+            }
+        }, []);
+
+        const handlePayNow = (invoiceId) => {
+            setIsPaying(true);
+            fetch('/api/pay-invoice/', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-CSRFToken': CSRF_TOKEN },
+                body: JSON.stringify({ invoice_id: invoiceId })
+            })
+            .then(res => res.json())
+            .then(d => {
+                if (d.checkout_url) window.location.href = d.checkout_url;
+                else alert("Failed to initiate payment.");
+            })
+            .finally(() => setIsPaying(false));
+        };
+
+        const handleCreateTicket = (e) => {
+            e.preventDefault();
+            fetch('/api/create-ticket/', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-CSRFToken': CSRF_TOKEN },
+                body: JSON.stringify(ticketData)
+            })
+            .then(res => res.json())
+            .then(d => {
+                if (d.success) {
+                    alert("Ticket created successfully!");
+                    setIsTicketOpen(false);
+                    setTicketData({ subject: '', message: '' });
+                }
+            });
+        };
+
+        const StatusBadge = ({ status }) => {
+            const styles = { PAID: 'bg-green-100 text-green-700', UNPAID: 'bg-yellow-100 text-yellow-700' };
+            return <span className={`px-2.5 py-1 rounded-full text-[10px] md:text-xs font-bold ${styles[status] || 'bg-gray-100'}`}>{status}</span>;
+        };
+
+        if (loading) {
+            return (
+                <div className="h-screen bg-bg flex flex-col md:flex-row p-6 gap-6">
+                    <Skeleton className="w-64 h-full hidden md:block" />
+                    <div className="flex-1 flex flex-col gap-6">
+                        <Skeleton className="w-1/3 h-10" />
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                            <Skeleton className="h-40" />
+                            <Skeleton className="h-40" />
+                            <Skeleton className="h-40" />
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        if (error) {
+            return (
+                <div className="h-screen bg-bg flex items-center justify-center p-4">
+                    <div className="bg-white p-8 rounded-2xl shadow-sm border border-border text-center max-w-md w-full">
+                        <div className="text-red-500 mb-4 text-4xl">⚠️</div>
+                        <h1 className="text-xl font-bold text-navy mb-2">Oops!</h1>
+                        <p className="text-muted mb-6">{error}</p>
+                        <button onClick={() => window.location.reload()} className="bg-brand text-white px-6 py-3 rounded-xl font-semibold hover:bg-brand-hover">Refresh Page</button>
+                    </div>
+                </div>
+            );
+        }
+
+        return (
+            <div className="h-screen bg-bg flex flex-col md:flex-row font-sans text-text overflow-hidden">
+                {/* SIDEBAR */}
+                <aside className="hidden md:flex w-64 bg-navy text-white flex-col h-full flex-shrink-0">
+                    <div className="p-6 flex items-center bg-white"><img src={LOGO_URL} className="h-[34px]" /></div>
+                    <nav className="flex-grow p-4 flex flex-col gap-1">
+                        <a href="#" className="px-4 py-3 rounded-xl bg-navy-light text-white font-medium flex items-center gap-3">
+                            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"></path></svg>
+                            Overview
+                        </a>
+                        <a href={PROFILE_URL} className="px-4 py-3 rounded-xl text-navy-text hover:bg-navy-light hover:text-white font-medium flex items-center gap-3 transition-colors">
+                            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"></path></svg>
+                            Profile
+                        </a>
+                    </nav>
+                    <div className="p-4 border-t border-navy-light">
+                        <a href={window.LOGOUT_URL} className="px-4 py-3 rounded-xl text-red-300 hover:bg-red-500/20 font-medium flex items-center gap-3 transition-colors">
+                            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"></path></svg>
+                            Sign Out
+                        </a>
+                    </div>
+                </aside>
+
+                {/* MAIN CONTENT */}
+                <main className="flex-1 h-full overflow-y-auto bg-bg relative">
+                    <div className="p-4 md:p-8 flex flex-col gap-6 w-full max-w-[1200px] mx-auto pb-24 md:pb-8">
+                        
+                        {showSuccessBanner && (
+                            <motion.div initial={{ opacity: 0, y: -20 }} animate={{ opacity: 1, y: 0 }} className="bg-green-100 border border-green-200 text-green-800 p-4 rounded-xl flex items-center justify-between">
+                                <div className="flex items-center gap-3 font-medium">
+                                    <span className="text-2xl">🎉</span>
+                                    Payment successful! Setting up your hosting account...
+                                </div>
+                                <button onClick={() => setShowSuccessBanner(false)} className="text-green-800 hover:text-green-900">✕</button>
+                            </motion.div>
+                        )}
+
+                        <div>
+                            <h1 className="text-xl md:text-2xl font-heading font-bold text-navy">Welcome back, {data.user_name}</h1>
+                            <p className="text-muted text-xs md:text-sm mt-1">Here is where your website and billing stand.</p>
+                        </div>
+
+                        {data.project && <ProjectTimeline currentStage={data.project.stage} />}
+
+                        {/* TOP GRID: Package, Hosting, Usage */}
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 md:gap-6">
+                            {/* 1. Package Card */}
+                            <div className="bg-white border border-border rounded-[18px] p-6 flex flex-col gap-2 shadow-sm">
+                                <span className="text-sm text-muted font-medium">Current package</span>
+                                {data.subscription ? (
+                                    <>
+                                        <h2 className="text-2xl font-heading font-bold text-navy">{data.subscription.plan_name}</h2>
+                                        <p className="text-sm">MWK {Number(data.subscription.price).toLocaleString()} / year</p>
+                                        <span className="bg-green-100 text-green-700 px-3 py-1 rounded-full text-xs font-bold self-start mt-2">Active</span>
+                                    </>
+                                ) : (
+                                    <h2 className="text-lg font-heading font-bold text-navy">No Active Plan</h2>
+                                )}
+                            </div>
+
+                            {/* 2. Hosting Account Card (Dynamic Status) */}
+                            <div className="bg-white border border-border rounded-[18px] p-6 flex flex-col shadow-sm">
+                                <span className="text-sm text-muted font-medium mb-1">Hosting Account</span>
+                                {data.hosting_status === 'active' ? (
+                                    <>
+                                        <h2 className="text-xl font-heading font-bold text-navy">Active</h2>
+                                        <p className="text-xs text-muted mb-4">User: {data.hestia_username}</p>
+                                        <a href="https://sme.pritechmw.com:8083" target="_blank" rel="noreferrer" className="bg-brand text-white text-center text-sm font-semibold py-2 rounded-lg hover:bg-brand-hover mt-auto">
+                                            Login to cPanel
+                                        </a>
+                                    </>
+                                ) : data.hosting_status === 'provisioning' ? (
+                                    <div className="flex flex-col items-center justify-center h-full gap-3 py-2">
+                                        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-brand"></div>
+                                        <p className="text-xs text-muted text-center">Setting up your server...<br/>This takes ~2 minutes.</p>
+                                    </div>
+                                ) : (
+                                    <div className="flex flex-col items-center justify-center h-full text-center py-2">
+                                        <h2 className="text-lg font-heading font-bold text-gray-400">Pending</h2>
+                                        <p className="text-xs text-muted mt-1">Complete payment to activate.</p>
+                                    </div>
+                                )}
+                            </div>
+
+                            {/* 3. Usage Card */}
+                            <div className="bg-white border border-border rounded-[18px] p-6 flex flex-col shadow-sm">
+                                <span className="text-sm text-muted font-medium mb-4">Usage this month</span>
+                                <div className="flex flex-col gap-4">
+                                    <div>
+                                        <div className="flex justify-between text-xs mb-1"><span>Disk</span><span>{data.usage.disk_used} / {data.usage.disk_limit} GB</span></div>
+                                        <div className="h-2 w-full bg-border rounded-full"><div className="h-full bg-brand rounded-full" style={{width: `${data.usage.disk_pct}%`}}></div></div>
+                                    </div>
+                                    <div>
+                                        <div className="flex justify-between text-xs mb-1"><span>Bandwidth</span><span>{data.usage.bw_used} / {data.usage.bw_limit} GB</span></div>
+                                        <div className="h-2 w-full bg-border rounded-full"><div className="h-full bg-brand rounded-full" style={{width: `${data.usage.bw_pct}%`}}></div></div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        {/* MIDDLE GRID: Invoices & Domain */}
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                            <div className="bg-white border border-border rounded-[18px] p-6 md:col-span-2 shadow-sm">
+                                <h2 className="text-lg font-heading font-bold text-navy mb-4">Recent Invoices</h2>
+                                {data.invoices.length > 0 ? data.invoices.map((inv, i) => (
+                                    <div key={i} className="flex justify-between py-3 border-b last:border-0 items-center">
+                                        <div><p className="font-semibold text-sm">{inv.number}</p><p className="text-xs text-muted">{inv.date}</p></div>
+                                        <span className="text-sm font-medium">MWK {Number(inv.amount).toLocaleString()}</span>
+                                        <StatusBadge status={inv.status} />
+                                        <a href={`/invoices/${inv.id}/pdf/`} className="text-brand text-sm font-semibold hover:underline">
+                                            {inv.status === 'PAID' ? 'Receipt' : 'Invoice PDF'}
+                                        </a>
+                                    </div>
+                                )) : <p className="text-sm text-muted py-4">No invoices found.</p>}
+                            </div>
+
+                            <div className="flex flex-col gap-6">
+                                {data.next_invoice && (
+                                    <div className="bg-white border-2 border-brand rounded-[18px] p-6 shadow-sm flex flex-col gap-3">
+                                        <span className="text-sm text-muted font-medium">Next invoice</span>
+                                        <h2 className="text-2xl font-heading font-bold text-navy">{fmt(data.next_invoice.amount)}</h2>
+                                        <p className="text-xs">{data.next_invoice.number}, due {data.next_invoice.due_date}.</p>
+                                        <button onClick={() => handlePayNow(data.next_invoice.id)} disabled={isPaying} className="bg-brand text-white font-semibold py-2.5 rounded-xl hover:bg-brand-hover mt-2 disabled:opacity-50">
+                                            {isPaying ? 'Processing...' : 'Pay now'}
+                                        </button>
+                                    </div>
+                                )}
+                                <div className="bg-white border border-border rounded-[18px] p-6 shadow-sm">
+                                    <h2 className="text-lg font-heading font-bold text-navy mb-2">Domain</h2>
+                                    <p className="text-sm">{data.project?.domain || 'No domain connected yet.'}</p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div className="bg-navy text-white rounded-[18px] p-6 flex flex-col md:flex-row items-center justify-between gap-4 shadow-lg mt-2">
+                            <div>
+                                <h2 className="text-lg font-heading font-bold mb-1">Need help?</h2>
+                                <p className="text-navy-text text-sm">Our support team is available Monday to Friday, 8:00 to 17:00.</p>
+                            </div>
+                            <button onClick={() => setIsTicketOpen(true)} className="bg-white text-navy font-semibold px-6 py-3 rounded-xl hover:bg-gray-100 w-full md:w-auto transition-colors">
+                                Open a ticket
+                            </button>
+                        </div>
+                    </div>
+                </main>
+
+                {/* MOBILE BOTTOM NAV */}
+                <div className="fixed bottom-0 left-0 w-full bg-white border-t border-border flex justify-around items-center py-2 px-2 md:hidden z-50 shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.05)]">
+                    <a href="#" className="flex flex-col items-center gap-1 text-brand">
+                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"></path></svg>
+                        <span className="text-[10px] font-medium">Home</span>
+                    </a>
+                    <a href={PROFILE_URL} className="flex flex-col items-center gap-1 text-muted hover:text-navy transition-colors">
+                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"></path></svg>
+                        <span className="text-[10px] font-medium">Profile</span>
+                    </a>
+                    <a href={window.LOGOUT_URL} className="flex flex-col items-center gap-1 text-red-500 hover:text-red-600 transition-colors">
+                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"></path></svg>
+                        <span className="text-[10px] font-medium">Sign Out</span>
+                    </a>
+                </div>
+
+                <Modal isOpen={isTicketOpen} onClose={() => setIsTicketOpen(false)} title="Open a Support Ticket">
+                    <form onSubmit={handleCreateTicket} className="flex flex-col gap-4">
+                        <div>
+                            <label className="text-sm font-semibold text-navy">Subject</label>
+                            <input type="text" required className="w-full border border-border rounded-lg p-3 mt-1 focus:outline-none focus:border-brand" value={ticketData.subject} onChange={(e) => setTicketData({...ticketData, subject: e.target.value})} />
+                        </div>
+                        <div>
+                            <label className="text-sm font-semibold text-navy">Message</label>
+                            <textarea required rows="4" className="w-full border border-border rounded-lg p-3 mt-1 focus:outline-none focus:border-brand" value={ticketData.message} onChange={(e) => setTicketData({...ticketData, message: e.target.value})}></textarea>
+                        </div>
+                        <button type="submit" className="bg-brand text-white font-semibold py-3 rounded-xl hover:bg-brand-hover mt-2">Submit Ticket</button>
+                    </form>
+                </Modal>
+            </div>
+        );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<DashboardPage />);
+</script>
+{% endverbatim %}
+{% endblock %}
