@@ -42,6 +42,34 @@ class User(AbstractUser):
         verbose_name_plural = _("Users")
         ordering = ['-date_joined']
 
+    def save(self, *args, **kwargs):
+        """
+        Guarantee username is never empty.
+        
+        Why? `AbstractUser` has a unique constraint on `username`. When 
+        django-allauth creates a user via Google sign-in, it does not set a 
+        username (because we configured it to use email as the primary 
+        identifier). The default value is an empty string `''`. 
+        The first Google user gets `''`, but the second one triggers a 
+        `UniqueViolation` error on the database.
+        
+        This override derives a unique username from the email address.
+        """
+        if not self.username:
+            # Get the part before the '@' symbol
+            base_username = self.email.split('@')[0] if self.email else 'user'
+            username = base_username
+            suffix = 1
+            
+            # Keep checking until we find a username that isn't taken yet
+            while User.objects.filter(username=username).exclude(pk=self.pk).exists():
+                username = f"{base_username}{suffix}"
+                suffix += 1
+                
+            self.username = username
+            
+        super().save(*args, **kwargs)
+
     def __str__(self):
         return self.email or self.username
 
