@@ -1,8 +1,6 @@
 # billing/services/paychangu.py
 import requests
-import uuid
 from django.conf import settings
-from decimal import Decimal
 import logging
 
 logger = logging.getLogger(__name__)
@@ -10,7 +8,7 @@ logger = logging.getLogger(__name__)
 class PayChanguService:
     """
     Service layer for interacting with the PayChangu API.
-    Handles initiating transactions, verifying payments, and webhook validation.
+    Handles initiating transactions and verifying payments.
     """
     
     @staticmethod
@@ -26,9 +24,10 @@ class PayChanguService:
         Initiates a Standard Checkout payment with PayChangu.
         Returns the checkout URL to redirect the user to.
         """
-        tx_ref = str(uuid.uuid4())
+        # Tie the transaction directly to the invoice ID using a clear prefix.
+        # PayChangu will send this back to us as the `reference` in the webhook.
+        tx_ref = f"INV-{invoice.id}"
         
-        # PayChangu accepts the amount as an integer (e.g., 62500 for MWK 62,500)
         amount = int(invoice.total_mwk)
         
         payload = {
@@ -43,9 +42,6 @@ class PayChanguService:
             "customization": {
                 "title": f"Pritech Host - Invoice {invoice.invoice_number}",
                 "description": "Payment for hosting services."
-            },
-            "meta": {
-                "invoice_id": invoice.id
             }
         }
 
@@ -53,13 +49,13 @@ class PayChanguService:
             response = requests.post(
                 f"{settings.PAYCHANGU_BASE_URL}/payment",
                 json=payload,
-                headers=PayChanguService._get_headers()
+                headers=PayChanguService._get_headers(),
+                timeout=15
             )
             response.raise_for_status()
             data = response.json()
             
             if data.get('status') == 'success':
-                # Return the URL where the user can complete payment
                 return data['data']['checkout_url']
             else:
                 logger.error(f"PayChangu initiation failed: {data}")
@@ -70,20 +66,22 @@ class PayChanguService:
             return None
 
     @staticmethod
-    def verify_payment(charge_id):
+    def verify_payment(tx_ref):
         """
-        Verifies a payment using its charge_id.
+        Verifies a payment using its tx_ref (e.g., INV-123).
         SRS FR-16: The system verifies the payment through the gateway's verify API
         before marking an invoice paid.
         """
         try:
             response = requests.get(
-                f"{settings.PAYCHANGU_BASE_URL}/mobile-money/payments/{charge_id}/verify",
-                headers=PayChanguService._get_headers()
+                f"{settings.PAYCHANGU_BASE_URL}/verify-payment/{tx_ref}",
+                headers=PayChanguService._get_headers(),
+                timeout=10
             )
             response.raise_for_status()
             data = response.json()
-            return data.get('status') == 'successful'
+            # PayChangu returns {'status': 'success', 'data': {...}}
+            return data.get('status') == 'success'
         except requests.exceptions.RequestException as e:
-            logger.error(f"PayChangu verification failed: {e}")
+            logger.error(f"PayChangu verification failed for {tx_ref}: {e}")
             return False

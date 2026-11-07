@@ -328,50 +328,72 @@ class InvoicePDFView(LoginRequiredMixin, View):
 @method_decorator(csrf_exempt, name='dispatch')
 class PayChanguWebhookView(View):
     def post(self, request, *args, **kwargs):
+        # Log the raw body so we can see exactly what PayChangu sends
+        logger.info(f"PayChangu Webhook Payload: {request.body.decode('utf-8', errors='replace')}")
+
         signature = request.headers.get('Signature')
-        if not signature: return HttpResponse(status=400)
+        if not signature: 
+            logger.warning("Webhook: Missing Signature header.")
+            return HttpResponse(status=400)
 
         computed_signature = hmac.new(
             settings.PAYCHANGU_WEBHOOK_SECRET.encode(), request.body, hashlib.sha256
         ).hexdigest()
 
-        if not hmac.compare_digest(computed_signature, signature): return HttpResponse(status=401)
+        if not hmac.compare_digest(computed_signature, signature): 
+            logger.warning("Webhook: Invalid Signature.")
+            return HttpResponse(status=401)
 
         try:
             payload = json.loads(request.body)
         except json.JSONDecodeError:
             return HttpResponse(status=400)
 
-        if payload.get('status') == 'success':
-            charge_id = payload.get('charge_id')
-            invoice_id = payload.get('meta', {}).get('invoice_id')
-            
-            if not invoice_id or not charge_id: return HttpResponse(status=200)
+        # PayChangu sends 'reference' (our tx_ref) and 'status'
+        status = payload.get('status')
+        tx_ref = payload.get('reference') or payload.get('tx_ref')
+        charge_id = payload.get('charge_id')
+
+        if status == 'success':
+            if not tx_ref:
+                logger.warning("Webhook: Missing tx_ref/reference in payload.")
+                return HttpResponse(status=200)
 
             try:
+                # Extract the invoice ID from our tx_ref (e.g., "INV-42" -> 42)
+                invoice_id = int(tx_ref.split('-')[-1])
                 invoice = Invoice.objects.get(id=invoice_id)
-                if invoice.status == 'paid': return HttpResponse(status=200)
+            except (ValueError, IndexError, Invoice.DoesNotExist):
+                logger.error(f"Webhook: Could not find invoice for reference {tx_ref}")
+                return HttpResponse(status=200)
 
-                if PayChanguService.verify_payment(charge_id):
-                    invoice.status = 'paid'
-                    invoice.save()
+            if invoice.status == 'paid':
+                logger.info(f"Webhook: Invoice {invoice.invoice_number} is already paid. Ignoring.")
+                return HttpResponse(status=200)
 
-                    Payment.objects.create(
-                        invoice=invoice, amount_mwk=invoice.total_mwk, gateway_reference=charge_id,
-                        status='success', payment_method='airtel' 
-                    )
-                    
-                    # 1. Send Payment Receipt Email
-                    send_payment_confirmation(invoice)
+            # Verify via API using the tx_ref
+            if PayChanguService.verify_payment(tx_ref):
+                invoice.status = 'paid'
+                invoice.save()
 
-                    # 2. Trigger Automated Provisioning (only for the initial deposit)
-                    if invoice.is_deposit:
-                        provision_hosting_account(invoice)
-                    
-                    logger.info(f"Invoice {invoice.invoice_number} paid, receipt sent, and provisioning triggered.")
-            except Exception as e:
-                logger.error(f"Webhook error: {e}")
-                return HttpResponse(status=500)
+                Payment.objects.create(
+                    invoice=invoice, 
+                    amount_mwk=invoice.total_mwk, 
+                    gateway_reference=charge_id or tx_ref,
+                    status='success', 
+                    payment_method='airtel' 
+                )
+                
+                # 1. Send Payment Receipt Email
+                send_payment_confirmation(invoice)
+
+                # 2. Trigger Automated Provisioning (only for the initial deposit)
+                if invoice.is_deposit:
+                    provision_hosting_account(invoice)
+                
+                logger.info(f"Webhook: Invoice {invoice.invoice_number} paid, email sent, provisioning triggered.")
+            else:
+                logger.warning(f"Webhook: API verification failed for {tx_ref}")
 
         return HttpResponse(status=200)
 
