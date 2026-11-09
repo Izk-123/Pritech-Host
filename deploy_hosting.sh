@@ -3,10 +3,18 @@
 # Pritech Host — Production Deployment Script (Bulletproof)
 # Repo   : https://github.com/Izk-123/Pritech-Host.git
 # Domain : pritechhost.com
+#
+# Provisions:
+#   • system packages (git, python, postgres, nginx, redis)
+#   • python venv + requirements + celery/redis/gunicorn/psycopg2
+#   • PostgreSQL role + database (password synced from .env)
+#   • Django migrate / collectstatic / admin bootstrap
+#   • systemd : gunicorn, celery worker, celery beat
+#   • nginx reverse proxy
 # ============================================================================
 
 set -euo pipefail
-set +H  # Disable history expansion (so passwords with '!' don't break)
+set +H  # Disable history expansion so passwords with '!' don't break
 
 # ─── Configuration ──────────────────────────────────────────────────────────
 PROJECT_NAME="pritechhost"
@@ -24,7 +32,11 @@ DB_USER="pritechhost_user"
 
 WSGI_APP="pritech_host.wsgi:application"
 DJANGO_SETTINGS="pritech_host.settings"
+CELERY_APP="pritech_host"
 GUNICORN_SOCK="${PROJECT_DIR}/gunicorn.sock"
+
+CELERY_QUEUES="default,emails,provisioning"
+CELERY_CONCURRENCY="2"     # keep low on small VPS; raise if you have CPU headroom
 
 # ─── Logging Helpers ────────────────────────────────────────────────────────
 log()  { printf '\n\033[1;36m▸ %s\033[0m\n' "$*"; }
@@ -37,8 +49,8 @@ printf '\033[1;35m  Pritech Host Deploy — %s\033[0m\n' "$(date '+%Y-%m-%d %H:%
 printf '\033[1;35m══════════════════════════════════════════════════════════\033[0m\n'
 
 [[ $EUID -eq 0 ]] || die "Run as root."
-for cmd in git python3 pip3 psql nginx openssl; do
-    command -v $cmd &>/dev/null || die "Missing: $cmd"
+for cmd in git python3 pip3 psql nginx openssl systemctl; do
+    command -v "$cmd" &>/dev/null || die "Missing: $cmd"
 done
 ok "System dependencies verified."
 
@@ -59,36 +71,40 @@ fi
 cd "${PROJECT_DIR}"
 
 # ============================================================================
-# 2. Virtual Environment
+# 2. Python Environment
 # ============================================================================
 log "Step 2: Python environment"
 if [ ! -d "${VENV_DIR}" ]; then
     python3 -m venv "${VENV_DIR}"
     ok "Virtualenv created."
 fi
+# shellcheck disable=SC1091
 source "${VENV_DIR}/bin/activate"
 pip install --upgrade pip wheel --quiet
 pip install -r requirements.txt --quiet
-pip install gunicorn psycopg2-binary --quiet
-ok "Dependencies installed."
+# Celery + Redis client + gunicorn + postgres driver.
+# (Also add these to requirements.txt in the repo so future deploys are
+#  deterministic — pip install is idempotent so re-running is safe.)
+pip install celery redis gunicorn psycopg2-binary --quiet
+ok "Python dependencies installed."
 
 # ============================================================================
-# 3. Environment Variables (The Core Fix)
+# 3. Environment Variables
 # ============================================================================
 log "Step 3: Environment variables"
 if [ -f "${PROJECT_DIR}/.env" ]; then
-    # Read existing DB_PASSWORD safely, stripping any carriage returns or quotes
+    # Read existing DB password safely (strip CR / surrounding quotes).
     DB_PASS=$(grep -E '^DB_PASSWORD=' "${PROJECT_DIR}/.env" | cut -d= -f2- | tr -d '\r' | tr -d '"' | tr -d "'" || true)
-    
     if [ -z "${DB_PASS}" ]; then
         die "DB_PASSWORD is empty or missing in existing .env. Fix .env first."
     fi
-    ok ".env exists — loaded DB_PASSWORD from file."
+    ok ".env exists — loaded DB_PASSWORD."
 else
-    # First-time install: generate secure alphanumeric secrets
+    # First-time install: generate secure secrets.
     DB_PASS="$(openssl rand -base64 32 | tr -d '/+=!@#$%^&*()_+-' | cut -c1-24)"
     DJANGO_SECRET="$(openssl rand -base64 48 | tr -d '/+=!@#$%^&*()_+-' | cut -c1-50)"
     cat > "${PROJECT_DIR}/.env" <<EOF
+# ── Django core ─────────────────────────────────────────────────────────────
 SECRET_KEY=${DJANGO_SECRET}
 DEBUG=False
 PRIMARY_DOMAIN=${DOMAIN}
@@ -97,6 +113,8 @@ SITE_ID=1
 ALLOWED_HOSTS=${DOMAIN},${WWW_DOMAIN},${SERVER_IP},127.0.0.1,localhost
 CSRF_TRUSTED_ORIGINS=https://${DOMAIN},https://${WWW_DOMAIN}
 
+# ── Database (PostgreSQL) ───────────────────────────────────────────────────
+DATABASE_URL=postgres://${DB_USER}:${DB_PASS}@127.0.0.1:5432/${DB_NAME}
 DB_ENGINE=django.db.backends.postgresql
 DB_NAME=${DB_NAME}
 DB_USER=${DB_USER}
@@ -104,11 +122,13 @@ DB_PASSWORD=${DB_PASS}
 DB_HOST=127.0.0.1
 DB_PORT=5432
 
+# ── PayChangu ───────────────────────────────────────────────────────────────
 PAYCHANGU_SECRET_KEY=sec-test-yourkey-here
 PAYCHANGU_WEBHOOK_SECRET=sme.pritechmw
 PAYCHANGU_CALLBACK_URL=https://${DOMAIN}/payments/callback/
 PAYCHANGU_RETURN_URL=https://${DOMAIN}/payments/return/
 
+# ── Email (cPanel SMTP) ─────────────────────────────────────────────────────
 EMAIL_HOST=mail.pritechmw.com
 EMAIL_PORT=465
 EMAIL_HOST_USER=noreply@pritechmw.com
@@ -118,8 +138,14 @@ EMAIL_USE_TLS=False
 DEFAULT_FROM_EMAIL=Pritech Host <noreply@pritechmw.com>
 SALES_EMAIL=sales@pritechmw.com
 
+# ── Celery / Redis ──────────────────────────────────────────────────────────
+CELERY_BROKER_URL=redis://127.0.0.1:6379/0
+CELERY_RESULT_BACKEND=redis://127.0.0.1:6379/0
+
+# ── Feature flags ───────────────────────────────────────────────────────────
 HESTIA_MOCK=True
 
+# ── Cookies / HTTPS (set True once SSL terminates correctly) ────────────────
 SECURE_SSL_REDIRECT=False
 SESSION_COOKIE_SECURE=False
 CSRF_COOKIE_SECURE=False
@@ -130,13 +156,33 @@ EOF
 fi
 
 # ============================================================================
-# 4. PostgreSQL (Force Sync Password)
+# 4. Redis (Celery broker)
 # ============================================================================
-log "Step 4: PostgreSQL configuration"
-# Escape single quotes in case user manually added them
+log "Step 4: Redis broker"
+if ! command -v redis-server &>/dev/null; then
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y redis-server redis-tools -qq
+    ok "Redis installed."
+else
+    ok "Redis already installed."
+fi
+
+systemctl enable redis-server > /dev/null 2>&1 || true
+systemctl restart redis-server
+sleep 1
+
+if ! redis-cli ping 2>/dev/null | grep -q PONG; then
+    die "Redis is not responding on 127.0.0.1:6379. Check: journalctl -u redis-server -n 50"
+fi
+ok "Redis is up (PONG)."
+
+# ============================================================================
+# 5. PostgreSQL (force role password to match .env)
+# ============================================================================
+log "Step 5: PostgreSQL configuration"
+# Escape single quotes in case the password contains them.
 ESCAPED_PASS=$(printf '%s' "${DB_PASS}" | sed "s/'/''/g")
 
-# Create role or force-update its password to match .env
 sudo -u postgres psql <<SQL > /dev/null
 DO \$\$
 BEGIN
@@ -153,24 +199,23 @@ SQL
 sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname = '${DB_NAME}'" | grep -q 1 \
     || sudo -u postgres createdb -O "${DB_USER}" "${DB_NAME}"
 
-# Grant permissions
 sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE ${DB_NAME} TO ${DB_USER};" > /dev/null
 sudo -u postgres psql -d "${DB_NAME}" -c "GRANT ALL ON SCHEMA public TO ${DB_USER};" > /dev/null
-ok "Database role and password forced to match .env."
+ok "Database role and password synced with .env."
 
 # ============================================================================
-# 5. Test Database Connection
+# 6. Test Database Connection
 # ============================================================================
-log "Step 5: Testing database connection"
+log "Step 6: Testing database connection"
 if ! PGPASSWORD="${DB_PASS}" psql -h 127.0.0.1 -U "${DB_USER}" -d "${DB_NAME}" -c "SELECT 1;" > /dev/null 2>&1; then
-    die "Database connection failed. Check your .env DB_PASSWORD and pg_hba.conf."
+    die "Database connection failed. Check .env DB_PASSWORD and pg_hba.conf."
 fi
 ok "Database connection successful."
 
 # ============================================================================
-# 6. Django Setup
+# 7. Django Setup
 # ============================================================================
-log "Step 6: Running Django setup"
+log "Step 7: Running Django setup"
 export DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS}"
 
 python manage.py migrate --noinput > /dev/null
@@ -189,18 +234,21 @@ if not User.objects.filter(is_superuser=True).exists():
 else:
     print("  ✔ Superuser already exists.")
 
-Site.objects.update_or_create(id=1, defaults={'domain': 'pritechhost.com', 'name': 'Pritech Host'})
+Site.objects.update_or_create(
+    id=1, defaults={'domain': 'pritechhost.com', 'name': 'Pritech Host'}
+)
 print("  ✔ Allauth Site domain updated to pritechhost.com")
 PY
 
 # ============================================================================
-# 7. Gunicorn Service
+# 8. Gunicorn Service
 # ============================================================================
-log "Step 7: Configuring Gunicorn"
+log "Step 8: Configuring Gunicorn"
 cat > /etc/systemd/system/gunicorn-${PROJECT_NAME}.service <<EOF
 [Unit]
 Description=Gunicorn for Pritech Host
-After=network.target postgresql.service
+After=network.target postgresql.service redis-server.service
+Requires=postgresql.service
 
 [Service]
 User=root
@@ -223,23 +271,95 @@ systemctl restart gunicorn-${PROJECT_NAME}
 ok "Gunicorn configured and restarted."
 
 # ============================================================================
-# 8. Nginx Configuration
+# 9. Celery Worker Service
 # ============================================================================
-log "Step 8: Configuring Nginx"
+# Processes tasks from the three queues declared in settings.CELERY_TASK_ROUTES.
+# `-Ofair` prevents one slow task from blocking the whole prefetch batch.
+log "Step 9: Configuring Celery worker"
+cat > /etc/systemd/system/celery-${PROJECT_NAME}.service <<EOF
+[Unit]
+Description=Celery Worker for Pritech Host
+After=network.target redis-server.service postgresql.service
+Requires=redis-server.service
+
+[Service]
+User=root
+Group=root
+WorkingDirectory=${PROJECT_DIR}
+Environment="PATH=${VENV_DIR}/bin"
+Environment="DJANGO_SETTINGS_MODULE=${DJANGO_SETTINGS}"
+EnvironmentFile=${PROJECT_DIR}/.env
+ExecStart=${VENV_DIR}/bin/celery -A ${CELERY_APP} worker \\
+    --loglevel=info \\
+    --queues=${CELERY_QUEUES} \\
+    --concurrency=${CELERY_CONCURRENCY} \\
+    --without-gossip --without-mingle --without-heartbeat \\
+    -Ofair
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable celery-${PROJECT_NAME} > /dev/null
+systemctl restart celery-${PROJECT_NAME}
+ok "Celery worker configured and restarted."
+
+# ============================================================================
+# 10. Celery Beat Service (scheduler for future periodic tasks)
+# ============================================================================
+log "Step 10: Configuring Celery beat"
+cat > /etc/systemd/system/celery-beat-${PROJECT_NAME}.service <<EOF
+[Unit]
+Description=Celery Beat for Pritech Host
+After=network.target redis-server.service
+
+[Service]
+User=root
+Group=root
+WorkingDirectory=${PROJECT_DIR}
+Environment="PATH=${VENV_DIR}/bin"
+Environment="DJANGO_SETTINGS_MODULE=${DJANGO_SETTINGS}"
+EnvironmentFile=${PROJECT_DIR}/.env
+ExecStart=${VENV_DIR}/bin/celery -A ${CELERY_APP} beat --loglevel=info
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable celery-beat-${PROJECT_NAME} > /dev/null
+systemctl restart celery-beat-${PROJECT_NAME}
+ok "Celery beat configured and restarted."
+
+# ============================================================================
+# 11. Nginx Configuration
+# ============================================================================
+log "Step 11: Configuring Nginx"
 cat > /etc/nginx/sites-available/${PROJECT_NAME} <<EOF
 server {
     listen 80;
     server_name ${DOMAIN} ${WWW_DOMAIN} ${SERVER_IP};
     client_max_body_size 25M;
+
     location /static/ { alias ${PROJECT_DIR}/staticfiles/; expires 30d; access_log off; }
     location /media/  { alias ${PROJECT_DIR}/media/;      expires 7d;  }
+
     location / {
         proxy_pass http://unix:${GUNICORN_SOCK};
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header Host              \$host;
+        proxy_set_header X-Real-IP         \$remote_addr;
+        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_redirect off;
+
+        # Webhook endpoints can wait a few seconds, but not 60+. We rely on
+        # Celery to keep them fast; this is just a safety net.
+        proxy_read_timeout 60s;
     }
 }
 EOF
@@ -250,15 +370,23 @@ systemctl reload nginx
 ok "Nginx reloaded."
 
 # ============================================================================
-# 9. Done
+# 12. Done
 # ============================================================================
 printf '\n\033[1;35m══════════════════════════════════════════════════════════\033[0m\n'
 printf '\033[1;35m  Deployment Complete\033[0m\n'
 printf '\033[1;35m══════════════════════════════════════════════════════════\033[0m\n'
-systemctl is-active --quiet gunicorn-${PROJECT_NAME} && ok "Gunicorn is running." \
-    || warn "Gunicorn failed to start. Check: journalctl -u gunicorn-${PROJECT_NAME} -n 50"
+
+for svc in gunicorn-${PROJECT_NAME} celery-${PROJECT_NAME} celery-beat-${PROJECT_NAME} redis-server; do
+    if systemctl is-active --quiet "$svc"; then
+        ok "$svc is running."
+    else
+        warn "$svc is NOT running. Check: journalctl -u $svc -n 50"
+    fi
+done
+
 echo ""
-echo "  Test:   curl -I https://${DOMAIN}"
-echo "  Admin:  https://${DOMAIN}/admin/"
-echo "  Login:  admin@pritechhost.com / ChangeMe123!"
+echo "  Test :   curl -I https://${DOMAIN}"
+echo "  Admin:   https://${DOMAIN}/admin/"
+echo "  Login:   admin@pritechhost.com / ChangeMe123!"
+echo "  Celery:  journalctl -u celery-${PROJECT_NAME} -f"
 echo "  ⚠ CHANGE THE ADMIN PASSWORD IMMEDIATELY!"
