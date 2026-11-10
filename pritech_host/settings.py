@@ -28,8 +28,9 @@ Organisation
 14. Logging
 15. Cache (Redis-backed, shared across Gunicorn workers)
 16. Django Unfold (admin UI)
-17. Celery (background workers — email + provisioning)
-18. Misc
+17. Celery (background workers — email, provisioning, dunning)
+18. Celery Beat (scheduled tasks — daily renewal/dunning scan)
+19. Misc
 
 Deploy target:
   Domain       : pritechhost.com
@@ -40,7 +41,9 @@ Deploy target:
 
 import os
 from pathlib import Path
+
 import environ
+from celery.schedules import crontab
 
 
 # ==============================================================================
@@ -48,15 +51,15 @@ import environ
 # ==============================================================================
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# Initialise django-environ with sensible defaults.
+# django-environ defaults.
 # Every bool() / list() needs a default so a missing .env key can't silently
 # flip a security setting to the wrong value.
 env = environ.Env(
     # --- Core ---
     DEBUG=(bool, False),
 
-    # --- Security toggles (all OFF by default; enable via .env once HTTPS is
-    #     confirmed working on the live server) ---
+    # --- Security toggles (all OFF by default; enable via .env once HTTPS
+    #     is confirmed working on the live server) ---
     SECURE_SSL_REDIRECT=(bool, False),
     SESSION_COOKIE_SECURE=(bool, False),
     CSRF_COOKIE_SECURE=(bool, False),
@@ -69,6 +72,11 @@ env = environ.Env(
     # --- Email ---
     EMAIL_USE_SSL=(bool, True),
     EMAIL_USE_TLS=(bool, False),
+
+    # --- Celery / dunning ---
+    # Toggle the daily dunning scheduler on/off without redeploying code.
+    # Useful during maintenance windows or while triaging false-positives.
+    DUNNING_ENABLED=(bool, True),
 )
 
 # Load `.env` if it exists. Safe to skip in CI or fresh clones.
@@ -186,7 +194,7 @@ TEMPLATES = [
                 'django.contrib.auth.context_processors.auth',
                 'django.contrib.messages.context_processors.messages',
                 # Injects SiteSettings.load() as `site` in every template.
-                # Required — removing this breaks every page that uses {{ site.* }}.
+                # Required — removing this breaks every page using {{ site.* }}.
                 'core.context_processors.site_settings',
             ],
         },
@@ -336,7 +344,7 @@ SALES_EMAIL  = env('SALES_EMAIL',  default='sales@pritechmw.com')
 SERVER_EMAIL = DEFAULT_FROM_EMAIL
 
 # Abort SMTP after 20s so a dead mail server can't hang a Celery worker.
-# (The webhook itself never blocks on SMTP — email sending is a Celery task.)
+# (The webhook never blocks on SMTP — email sending is a Celery task.)
 EMAIL_TIMEOUT = env.int('EMAIL_TIMEOUT', default=20)
 
 
@@ -439,7 +447,7 @@ LOGGING = {
             'level': 'WARNING',
             'propagate': False,
         },
-        # Application loggers — webhook, provisioning, billing
+        # Application loggers — webhook, provisioning, billing, dunning
         'core': {
             'handlers': ['console'],
             'level': 'INFO',
@@ -464,12 +472,11 @@ LOGGING = {
 # ==============================================================================
 # SiteSettings.load() reads/writes django.core.cache. With the default
 # per-process LocMemCache, each Gunicorn worker has its *own* cache — meaning
-# an admin edit invalidates only one worker's cache and other workers keep
-# serving stale site content for up to 10 minutes.
+# an admin edit invalidates only one worker and the other two serve stale
+# site content for up to 10 minutes.
 #
 # Pointing the cache at Redis (DB 1, keeping DB 0 for Celery) gives a single
 # shared cache across all workers, so admin edits are visible immediately.
-# Falls back to LocMemCache if REDIS_CACHE_URL is unset.
 REDIS_CACHE_URL = env('REDIS_CACHE_URL', default='redis://127.0.0.1:6379/1')
 
 if REDIS_CACHE_URL:
@@ -479,7 +486,7 @@ if REDIS_CACHE_URL:
             'LOCATION': REDIS_CACHE_URL,
             'TIMEOUT': 600,          # default TTL = 10 minutes
             'OPTIONS': {
-                'db': '1',           # same as URL, but explicit for clarity
+                'db': '1',           # explicit for clarity
             },
         }
     }
@@ -536,11 +543,12 @@ UNFOLD = {
 
 
 # ==============================================================================
-# 17. CELERY (background workers — email + provisioning)
+# 17. CELERY (background workers — email, provisioning, dunning)
 # ==============================================================================
-# Celery offloads *email sending* and *hosting provisioning* from the
-# request/response cycle. The PayChangu webhook now returns 200 immediately
-# and simply queues tasks — no more risk of 30-second gateway timeouts.
+# Celery offloads email delivery, Hestia provisioning and the daily
+# renewal/dunning scan from the request/response cycle. The PayChangu
+# webhook returns 200 in ~50 ms instead of waiting 10–60 s for SMTP +
+# Hestia API.
 #
 # Run at least one worker:
 #   celery -A pritech_host worker -l info -Q default,emails,provisioning
@@ -570,8 +578,11 @@ CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
 
 # --- Safety rails -----------------------------------------------------------
 # Soft limit raises SoftTimeLimitExceeded (task can clean up), hard limit kills.
-CELERY_TASK_SOFT_TIME_LIMIT = 240   # 4 min
-CELERY_TASK_TIME_LIMIT      = 300   # 5 min hard cap
+# 240 s soft / 300 s hard is generous for a single email or a Hestia API call,
+# but the dunning scan iterates subscriptions — a slow loop is caught here
+# before it can hold a worker slot for hours.
+CELERY_TASK_SOFT_TIME_LIMIT = 240
+CELERY_TASK_TIME_LIMIT      = 300
 CELERY_TASK_TRACK_STARTED   = True
 
 # --- Routing ----------------------------------------------------------------
@@ -580,12 +591,47 @@ CELERY_TASK_TRACK_STARTED   = True
 CELERY_TASK_ROUTES = {
     'core.tasks.send_transactional_email_task':     {'queue': 'emails'},
     'hosting.tasks.provision_hosting_account_task': {'queue': 'provisioning'},
+    'billing.tasks.check_subscription_lifecycle':   {'queue': 'default'},
 }
 CELERY_TASK_DEFAULT_QUEUE = 'default'
 
 
 # ==============================================================================
-# 18. MISC
+# 18. CELERY BEAT (periodic tasks — daily renewal/dunning scan)
+# ==============================================================================
+# Runs `check_subscription_lifecycle` once per day at 00:30 Africa/Blantyre.
+# That task drives the full renewal + dunning timeline:
+#
+#   -30d  early reminder email
+#   -14d  generate renewal invoice + reminder with pay link
+#    -7d  reminder
+#    -3d  urgent reminder
+#    -1d  final reminder
+#     0d  expiry notice
+#    +7d  suspension warning (24h notice)
+#    +8d  SUSPEND Hestia account
+#   +30d  final warning (deletion in 15 days)
+#   +45d  delete Hestia account, cancel subscription
+#
+# Toggle the whole schedule off via DUNNING_ENABLED=False in .env — useful
+# during a maintenance window, or while triaging a customer complaint where
+# you don't want more reminder emails going out.
+# ------------------------------------------------------------------------------
+
+CELERY_BEAT_SCHEDULE = {}
+
+if env('DUNNING_ENABLED'):
+    CELERY_BEAT_SCHEDULE['check-subscription-lifecycle'] = {
+        'task': 'billing.tasks.check_subscription_lifecycle',
+        # 00:30 Africa/Blantyre = 22:30 UTC (CAT is UTC+2).
+        # Runs at 00:30 local, so any 24h clock day-boundary weirdness
+        # is already settled by the time staff check the dashboard at 08:00.
+        'schedule': crontab(hour=0, minute=30),
+    }
+
+
+# ==============================================================================
+# 19. MISC
 # ==============================================================================
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
