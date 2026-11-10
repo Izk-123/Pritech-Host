@@ -5,19 +5,21 @@
 <script>
     window.PRITECH_LOGO_URL = "{% static 'images/pritech-logo.svg' %}";
     window.DOC = {
-        slug:    "{{ document.slug|escapejs }}",
-        title:   "{{ document.title|escapejs }}",
-        version: "{{ document.version|escapejs }}",
+        slug:      "{{ document.slug|escapejs }}",
+        title:     "{{ document.title|escapejs }}",
+        version:   "{{ document.version|escapejs }}",
         effective: "{{ document.effective_date|date:'d F Y'|escapejs }}",
-        content: {{ document.content|json_script:"doc-content" }},
     };
     window.TABS = [
-        { slug: 'terms',   label: 'Terms of Service',  url: "{% url 'core:legal_document' 'terms' %}",   active: {% if active_slug == 'terms' %}true{% else %}false{% endif %} },
-        { slug: 'privacy', label: 'Privacy Policy',    url: "{% url 'core:legal_document' 'privacy' %}", active: {% if active_slug == 'privacy' %}true{% else %}false{% endif %} },
-        { slug: 'aup',     label: 'Acceptable Use',    url: "{% url 'core:legal_document' 'aup' %}",     active: {% if active_slug == 'aup' %}true{% else %}false{% endif %} },
-        { slug: 'refund',  label: 'Refund Policy',     url: "{% url 'core:legal_document' 'refund' %}",  active: {% if active_slug == 'refund' %}true{% else %}false{% endif %} },
+        { slug: 'terms',   label: 'Terms of Service', url: "{% url 'core:legal_document' 'terms' %}",   active: {% if active_slug == 'terms' %}true{% else %}false{% endif %} },
+        { slug: 'privacy', label: 'Privacy Policy',   url: "{% url 'core:legal_document' 'privacy' %}", active: {% if active_slug == 'privacy' %}true{% else %}false{% endif %} },
+        { slug: 'aup',     label: 'Acceptable Use',   url: "{% url 'core:legal_document' 'aup' %}",     active: {% if active_slug == 'aup' %}true{% else %}false{% endif %} },
+        { slug: 'refund',  label: 'Refund Policy',    url: "{% url 'core:legal_document' 'refund' %}",  active: {% if active_slug == 'refund' %}true{% else %}false{% endif %} },
     ];
 </script>
+
+{# content is a full HTML string, so it's passed in a proper application/json script tag #}
+{{ document.content|json_script:"doc-content" }}
 
 {% verbatim %}
 <script type="text/babel">
@@ -27,7 +29,8 @@
     const LOGO_URL = window.PRITECH_LOGO_URL;
     const DOC = window.DOC;
     const TABS = window.TABS;
-    // document.content comes in as JSON string from json_script
+
+    // content is a JSON-encoded string — parse it to get the raw HTML
     const CONTENT_HTML = JSON.parse(document.getElementById('doc-content').textContent);
 
     function LegalPage() {
@@ -93,7 +96,6 @@
                     </div>
                 </main>
 
-                {/* Typography styles for the injected HTML */}
                 <style>{`
                     .prose-legal h2 {
                         font-family: Poppins, sans-serif;
