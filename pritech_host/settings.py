@@ -196,6 +196,7 @@ TEMPLATES = [
                 # Injects SiteSettings.load() as `site` in every template.
                 # Required — removing this breaks every page using {{ site.* }}.
                 'core.context_processors.site_settings',
+                'core.context_processors.legal_documents',
             ],
         },
     },
