@@ -45,6 +45,11 @@ from django.views.generic import FormView, ListView, TemplateView, View
 from billing.models import Invoice, Payment, Plan, Subscription
 from billing.services.invoice_pdf import generate_invoice_pdf
 from billing.services.paychangu import PayChanguService
+from billing.services.payments import (
+    finalize_invoice_payment,
+    has_recent_pending_payment,
+    sync_pending_payments,
+)
 from hosting.models import HostingAccount
 from projects.models import Project
 from users.models import CustomerProfile, User
@@ -269,6 +274,10 @@ class DashboardAPIView(LoginRequiredMixin, View):
         user = request.user
         site = SiteSettings.load()
 
+        # Settle any payment PayChangu has confirmed but the webhook has not
+        # delivered yet, so the invoice never shows UNPAID after a paid checkout.
+        sync_pending_payments(user)
+
         # --- Related rows --------------------------------------------------
         subscription    = Subscription.objects.filter(user=user, is_active=True).first()
         hosting_account = HostingAccount.objects.filter(user=user).first()
@@ -377,6 +386,7 @@ class DashboardAPIView(LoginRequiredMixin, View):
                 } for t in tickets
             ],
             'open_tickets_count': open_tickets_count,
+            'payment_processing': has_recent_pending_payment(user),
         })
 
 
@@ -509,23 +519,20 @@ class InvoicePDFView(LoginRequiredMixin, View):
 @method_decorator(csrf_exempt, name='dispatch')
 class PayChanguWebhookView(View):
     """
-    PayChangu → server notification.
+    PayChangu -> server notification.
 
     Flow
     ----
-        1. Verify HMAC-SHA256 signature over the raw body.
-        2. Extract invoice id from ``tx_ref`` (format "INV-{id}").
-        3. If already paid → early return (idempotent).
-        4. Verify with PayChangu's verify endpoint before marking paid.
-        5. Mark paid, record Payment, **queue** background tasks:
-              • receipt email       (send_transactional_email_task)
-              • provisioning (deposit only)
-                                    (provision_hosting_account_task)
-        6. Return 200 — PayChangu considers anything 2xx success.
+        1. Verify the HMAC-SHA256 signature over the raw body.
+        2. Read the reference (tx_ref, format "INV-{id}-{attempt}").
+        3. finalize_invoice_payment(): verify with PayChangu's verify API,
+           mark the invoice paid once, record the Payment, and queue the
+           receipt email and provisioning (billing/services/payments.py).
+        4. Return 200.
 
-    Every post-payment side effect is async. The view does the *minimum*
-    database work needed to keep state consistent, then hands off to
-    Celery so a slow SMTP server or Hestia API can't time out the webhook.
+    The same function also runs from the browser callback and when the
+    dashboard loads, so a late or missed webhook can no longer leave a paid
+    invoice showing UNPAID.
     """
 
     def post(self, request, *args, **kwargs):
@@ -565,70 +572,37 @@ class PayChanguWebhookView(View):
             logger.warning("Webhook: Missing tx_ref/reference in payload.")
             return HttpResponse(status=200)
 
-        # --- 2. Locate invoice --------------------------------------------
-        try:
-            invoice_id = int(tx_ref.split('-')[-1])
-            invoice    = Invoice.objects.get(id=invoice_id)
-        except (ValueError, IndexError, Invoice.DoesNotExist):
-            logger.error("Webhook: Could not find invoice for %s", tx_ref)
-            return HttpResponse(status=200)
-
-        # --- 3. Idempotency -----------------------------------------------
-        if invoice.status == 'paid':
-            logger.info(
-                "Webhook: %s already paid — ignoring.", invoice.invoice_number,
+        # --- 2. Verify with PayChangu and settle the invoice --------------
+        invoice, newly_paid = finalize_invoice_payment(tx_ref)
+        if invoice is None:
+            logger.warning(
+                "Webhook: %s could not be verified or settled; the dashboard "
+                "sync will retry.", tx_ref,
             )
-            return HttpResponse(status=200)
-
-        # --- 4. Server-side verification ----------------------------------
-        if not PayChanguService.verify_payment(tx_ref):
-            logger.warning("Webhook: API verification failed for %s", tx_ref)
-            return HttpResponse(status=200)
-
-        # --- 5. Persist payment (fast, transactional) ---------------------
-        invoice.status = 'paid'
-        invoice.save()
-
-        Payment.objects.create(
-            invoice=invoice,
-            amount_mwk=invoice.total_mwk,
-            gateway_reference=charge_id or tx_ref,
-            status='success',
-            payment_method='airtel',
-        )
-
-        # --- 6. Queue async side effects ----------------------------------
-        # Receipt email — runs in the 'emails' queue (see CELERY_TASK_ROUTES).
-        send_transactional_email_task.delay(
-            subject=f"Payment Received - {invoice.invoice_number}",
-            template_name='payment_confirmed',
-            context={
-                'customer_name':  invoice.customer.first_name,
-                'invoice_number': invoice.invoice_number,
-                'amount':         invoice.total_mwk,
-                'dashboard_url':  "https://pritechhost.com/dashboard/",
-            },
-            to_email=invoice.customer.email,
-        )
-
-        # Provisioning — only for the deposit invoice, runs in 'provisioning'.
-        # The task itself sends the welcome email once Hestia is ready, so we
-        # don't queue that here (otherwise the customer could receive
-        # credentials before the account actually exists).
-        if invoice.is_deposit:
-            provision_hosting_account_task.delay(invoice.id)
-
-        logger.info(
-            "Webhook: %s paid, tasks queued (email%s).",
-            invoice.invoice_number,
-            " + provisioning" if invoice.is_deposit else "",
-        )
+        elif newly_paid:
+            logger.info("Webhook: %s paid, follow-up tasks queued.", invoice.invoice_number)
+        else:
+            logger.info("Webhook: %s already paid - ignoring.", invoice.invoice_number)
         return HttpResponse(status=200)
 
 
 class PaymentCallbackView(View):
-    """Browser redirect after successful payment at the gateway."""
+    """
+    Browser redirect after a successful payment at the gateway.
+
+    PayChangu adds tx_ref and status to the URL. We verify the payment with
+    PayChangu right here, so the dashboard is already correct when it opens
+    even if the webhook is a few seconds late. finalize_invoice_payment is
+    idempotent, so running next to the webhook is safe, and it only marks an
+    invoice paid when the gateway itself confirms the payment.
+    """
     def get(self, request, *args, **kwargs):
+        tx_ref = request.GET.get('tx_ref')
+        if tx_ref and request.GET.get('status', 'success') == 'success':
+            try:
+                finalize_invoice_payment(tx_ref)
+            except Exception:
+                logger.exception("Callback: could not settle %s", tx_ref)
         return redirect('/dashboard/?payment=success')
 
 
