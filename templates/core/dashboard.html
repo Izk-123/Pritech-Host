@@ -8,9 +8,6 @@
     window.PROFILE_URL      = "{% url 'core:profile' %}";
     window.CSRF_TOKEN       = "{{ csrf_token }}";
 
-    // Site-wide content — injected by the site_settings context processor.
-    // Used here only for the sidebar logo alt text; the API payload also
-    // exposes these values under `data.site` for runtime use.
     window.SITE = {
         name:  "{{ site.site_name|escapejs }}",
         email: "{{ site.contact_email|escapejs }}",
@@ -22,25 +19,21 @@
 <script type="text/babel">
     const { useState, useEffect } = React;
 
-    // Framer Motion shim — degrades to plain divs if the library didn't load.
     const hasMotion = !!window.Motion;
     const motion    = hasMotion ? window.Motion.motion : { div: (props) => <div {...props} /> };
 
-    // Globals.
     const LOGO_URL    = window.PRITECH_LOGO_URL;
     const CSRF_TOKEN  = window.CSRF_TOKEN;
     const PROFILE_URL = window.PROFILE_URL;
     const SITE        = window.SITE || {};
 
-    // MWK currency formatter.
     const fmt = (num) => new Intl.NumberFormat('en-MW', {
         style: 'currency', currency: 'MWK', maximumFractionDigits: 0,
     }).format(num || 0);
 
     // ==================================================================
-    // Reusable primitives
+    // Reusable primitives (unchanged)
     // ==================================================================
-
     const Skeleton = ({ className }) => (
         <div className={`animate-pulse bg-gray-200 rounded-lg ${className}`} />
     );
@@ -85,7 +78,116 @@
     );
 
     // ==================================================================
-    // Project timeline (desktop horizontal, mobile vertical)
+    // Renewal banner — decides between the 5 possible renewal states.
+    // ==================================================================
+    const RenewalBanner = ({ renewal, onPayNow }) => {
+        if (!renewal) return null;
+
+        const days = renewal.days_until_expiry;
+
+        // ── 1. Deletion scheduled (day 30+ past expiry) ──
+        if (renewal.scheduled_deletion_at) {
+            return (
+                <motion.div
+                    initial={{ opacity: 0, y: -20 }} animate={{ opacity: 1, y: 0 }}
+                    className="bg-red-100 border border-red-300 text-red-900 p-4 rounded-xl flex flex-col md:flex-row items-start md:items-center gap-3"
+                >
+                    <span className="text-2xl">🚨</span>
+                    <div className="flex-1">
+                        <p className="font-bold">Account scheduled for deletion on {renewal.scheduled_deletion_at}</p>
+                        <p className="text-sm">
+                            Your files will be permanently deleted unless the outstanding invoice is paid.
+                        </p>
+                    </div>
+                    {renewal.has_pending_renewal && (
+                        <button
+                            onClick={() => onPayNow(renewal.renewal_invoice_id)}
+                            className="bg-red-700 text-white font-semibold px-4 py-2 rounded-lg hover:bg-red-800 whitespace-nowrap"
+                        >
+                            Renew Now
+                        </button>
+                    )}
+                </motion.div>
+            );
+        }
+
+        // ── 2. Expired (0+ days past expiry) ──
+        if (renewal.is_expired) {
+            return (
+                <motion.div
+                    initial={{ opacity: 0, y: -20 }} animate={{ opacity: 1, y: 0 }}
+                    className="bg-red-50 border border-red-200 text-red-800 p-4 rounded-xl flex flex-col md:flex-row items-start md:items-center gap-3"
+                >
+                    <span className="text-2xl">⚠️</span>
+                    <div className="flex-1">
+                        <p className="font-semibold">
+                            Your subscription expired {Math.abs(days)} day{Math.abs(days) === 1 ? '' : 's'} ago.
+                        </p>
+                        <p className="text-sm">
+                            {renewal.is_in_grace_period
+                                ? 'Your account will be suspended in a few days. Please renew now.'
+                                : 'Your account is suspended. Renew to restore access.'}
+                        </p>
+                    </div>
+                    {renewal.has_pending_renewal && (
+                        <button
+                            onClick={() => onPayNow(renewal.renewal_invoice_id)}
+                            className="bg-red-600 text-white font-semibold px-4 py-2 rounded-lg hover:bg-red-700 whitespace-nowrap"
+                        >
+                            Renew Now
+                        </button>
+                    )}
+                </motion.div>
+            );
+        }
+
+        // ── 3. Approaching renewal (0-30 days, invoice pending) ──
+        if (days <= 30 && renewal.has_pending_renewal) {
+            return (
+                <motion.div
+                    initial={{ opacity: 0, y: -20 }} animate={{ opacity: 1, y: 0 }}
+                    className="bg-yellow-50 border border-yellow-200 text-yellow-800 p-4 rounded-xl flex flex-col md:flex-row items-start md:items-center gap-3"
+                >
+                    <span className="text-2xl">🔔</span>
+                    <div className="flex-1">
+                        <p className="font-semibold">
+                            Your plan renews in {days} day{days === 1 ? '' : 's'} ({renewal.end_date}).
+                        </p>
+                        <p className="text-sm">
+                            Pay your renewal invoice now to keep your website online.
+                        </p>
+                    </div>
+                    <button
+                        onClick={() => onPayNow(renewal.renewal_invoice_id)}
+                        className="bg-yellow-600 text-white font-semibold px-4 py-2 rounded-lg hover:bg-yellow-700 whitespace-nowrap"
+                    >
+                        Renew Now
+                    </button>
+                </motion.div>
+            );
+        }
+
+        // ── 4. Suspended (subscription.status = 'suspended') ──
+        if (renewal.status === 'suspended') {
+            return (
+                <motion.div
+                    initial={{ opacity: 0, y: -20 }} animate={{ opacity: 1, y: 0 }}
+                    className="bg-red-50 border border-red-200 text-red-800 p-4 rounded-xl flex items-center gap-3"
+                >
+                    <span className="text-2xl">⛔</span>
+                    <div className="flex-1">
+                        <p className="font-semibold">Your hosting account is suspended.</p>
+                        <p className="text-sm">Pay the outstanding invoice to reactivate your account immediately.</p>
+                    </div>
+                </motion.div>
+            );
+        }
+
+        return null;
+    };
+
+    // ==================================================================
+    // Project timeline (unchanged)
     // ==================================================================
     const ProjectTimeline = ({ currentStage }) => {
         const stages = [
@@ -111,8 +213,6 @@
         return (
             <div className="bg-white border border-border rounded-[18px] p-6 shadow-sm mb-6">
                 <h2 className="text-lg font-heading font-bold text-navy mb-6">Project Progress</h2>
-
-                {/* Desktop — horizontal track */}
                 <div className="hidden md:flex justify-between items-center relative w-full">
                     <div className="absolute top-3 left-0 w-full h-1 bg-border rounded -z-0"></div>
                     <div
@@ -132,8 +232,6 @@
                         );
                     })}
                 </div>
-
-                {/* Mobile — vertical stack */}
                 <div className="md:hidden flex flex-col gap-0 relative">
                     {stages.map((stage, index) => {
                         const isCompleted = index < currentIndex;
@@ -169,20 +267,15 @@
         const [isPaying, setIsPaying]         = useState(false);
         const [ticketData, setTicketData]     = useState({ subject: '', message: '' });
 
-        // Post-redirect banner state.
         const queryParams   = new URLSearchParams(window.location.search);
         const paymentStatus = queryParams.get('payment');
         const [showSuccessBanner, setShowSuccessBanner] = useState(paymentStatus === 'success');
 
-        // Polling after a payment redirect (stops as soon as it is settled).
         const pollRef = React.useRef(null);
         const stopPolling = () => {
             if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
         };
 
-        // ---------------------------------------------------------------
-        // Data fetch
-        // ---------------------------------------------------------------
         const fetchData = () => {
             fetch('/api/dashboard-data/')
                 .then(res => {
@@ -192,12 +285,7 @@
                 .then(d => {
                     setData(d);
                     setLoading(false);
-                    // Auto-hide the success banner once the unpaid invoice
-                    // has been resolved.
-                    if (showSuccessBanner && d.next_invoice === null) {
-                        setShowSuccessBanner(false);
-                    }
-                    // Payment confirmed (or nothing pending): stop polling.
+                    if (showSuccessBanner && d.next_invoice === null) setShowSuccessBanner(false);
                     if (!d.payment_processing) stopPolling();
                 })
                 .catch(err => {
@@ -209,8 +297,6 @@
 
         useEffect(() => {
             fetchData();
-            // Arriving from a payment: re-check every 4 seconds for up to
-            // about 80 seconds, until the server reports it is settled.
             if (paymentStatus === 'success') {
                 let tries = 0;
                 pollRef.current = setInterval(() => {
@@ -222,9 +308,6 @@
             }
         }, []);
 
-        // ---------------------------------------------------------------
-        // Actions
-        // ---------------------------------------------------------------
         const handlePayNow = (invoiceId) => {
             setIsPaying(true);
             fetch('/api/pay-invoice/', {
@@ -253,14 +336,11 @@
                     alert('Ticket created successfully!');
                     setIsTicketOpen(false);
                     setTicketData({ subject: '', message: '' });
-                    fetchData(); // Refresh so the new ticket appears in the list.
+                    fetchData();
                 }
             });
         };
 
-        // ---------------------------------------------------------------
-        // Loading / error screens
-        // ---------------------------------------------------------------
         if (loading) {
             return (
                 <div className="h-screen bg-bg flex flex-col md:flex-row p-6 gap-6">
@@ -287,17 +367,12 @@
                         <button
                             onClick={() => window.location.reload()}
                             className="bg-brand text-white px-6 py-3 rounded-xl font-semibold hover:bg-brand-hover"
-                        >
-                            Refresh Page
-                        </button>
+                        >Refresh Page</button>
                     </div>
                 </div>
             );
         }
 
-        // ---------------------------------------------------------------
-        // Main render
-        // ---------------------------------------------------------------
         return (
             <div className="h-screen bg-bg flex flex-col md:flex-row font-sans text-text overflow-hidden">
 
@@ -334,11 +409,10 @@
                 <main className="flex-1 h-full overflow-y-auto bg-bg relative">
                     <div className="p-4 md:p-8 flex flex-col gap-6 w-full max-w-[1200px] mx-auto pb-24 md:pb-8">
 
-                        {/* Success banner */}
+                        {/* Payment-success banner (unchanged) */}
                         {showSuccessBanner && (
                             <motion.div
-                                initial={{ opacity: 0, y: -20 }}
-                                animate={{ opacity: 1, y: 0 }}
+                                initial={{ opacity: 0, y: -20 }} animate={{ opacity: 1, y: 0 }}
                                 className="bg-green-100 border border-green-200 text-green-800 p-4 rounded-xl flex items-center justify-between"
                             >
                                 <div className="flex items-center gap-3 font-medium">
@@ -361,13 +435,14 @@
                             </p>
                         </div>
 
+                        {/* ────────── RENEWAL BANNER (NEW) ────────── */}
+                        <RenewalBanner renewal={data.renewal} onPayNow={handlePayNow} />
+
                         {/* Project timeline */}
                         {data.project && <ProjectTimeline currentStage={data.project.stage} />}
 
-                        {/* ========== TOP GRID — Package / Hosting / Usage ========== */}
+                        {/* Package / Hosting / Usage (unchanged) */}
                         <div className="grid grid-cols-1 md:grid-cols-3 gap-4 md:gap-6">
-
-                            {/* Package card — billing_period is dynamic per plan. */}
                             <div className="bg-white border border-border rounded-[18px] p-6 flex flex-col gap-2 shadow-sm">
                                 <span className="text-sm text-muted font-medium">Current package</span>
                                 {data.subscription ? (
@@ -387,7 +462,6 @@
                                 )}
                             </div>
 
-                            {/* Hosting account — status-aware, cPanel URL from API. */}
                             <div className="bg-white border border-border rounded-[18px] p-6 flex flex-col shadow-sm">
                                 <span className="text-sm text-muted font-medium mb-1">Hosting Account</span>
                                 {data.hosting_status === 'active' ? (
@@ -401,9 +475,7 @@
                                             target="_blank"
                                             rel="noreferrer"
                                             className="bg-brand text-white text-center text-sm font-semibold py-2 rounded-lg hover:bg-brand-hover mt-auto"
-                                        >
-                                            Login to cPanel
-                                        </a>
+                                        >Login to cPanel</a>
                                     </>
                                 ) : data.hosting_status === 'provisioning' ? (
                                     <div className="flex flex-col items-center justify-center h-full gap-3 py-2">
@@ -420,7 +492,6 @@
                                 )}
                             </div>
 
-                            {/* Usage card — real numbers only. */}
                             <div className="bg-white border border-border rounded-[18px] p-6 flex flex-col shadow-sm">
                                 <span className="text-sm text-muted font-medium mb-4">Usage this month</span>
                                 <div className="flex flex-col gap-4">
@@ -446,10 +517,8 @@
                             </div>
                         </div>
 
-                        {/* ========== MIDDLE GRID — Invoices / Next invoice + Domain ========== */}
+                        {/* Recent invoices + Next invoice + Domain (unchanged) */}
                         <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-
-                            {/* Recent invoices */}
                             <div className="bg-white border border-border rounded-[18px] p-6 md:col-span-2 shadow-sm">
                                 <h2 className="text-lg font-heading font-bold text-navy mb-4">Recent Invoices</h2>
                                 {data.invoices.length > 0 ? data.invoices.map((inv, i) => (
@@ -465,16 +534,13 @@
                                         <a
                                             href={`/invoices/${inv.id}/pdf/`}
                                             className="text-brand text-sm font-semibold hover:underline whitespace-nowrap"
-                                        >
-                                            {inv.status === 'PAID' ? 'Receipt' : 'Invoice PDF'}
-                                        </a>
+                                        >{inv.status === 'PAID' ? 'Receipt' : 'Invoice PDF'}</a>
                                     </div>
                                 )) : (
                                     <p className="text-sm text-muted py-4">No invoices found.</p>
                                 )}
                             </div>
 
-                            {/* Right column — Next invoice + Domain */}
                             <div className="flex flex-col gap-6">
                                 {data.next_invoice && (
                                     <div className="bg-white border-2 border-brand rounded-[18px] p-6 shadow-sm flex flex-col gap-3">
@@ -489,9 +555,7 @@
                                             onClick={() => handlePayNow(data.next_invoice.id)}
                                             disabled={isPaying}
                                             className="bg-brand text-white font-semibold py-2.5 rounded-xl hover:bg-brand-hover mt-2 disabled:opacity-50"
-                                        >
-                                            {isPaying ? 'Processing...' : 'Pay now'}
-                                        </button>
+                                        >{isPaying ? 'Processing...' : 'Pay now'}</button>
                                     </div>
                                 )}
                                 <div className="bg-white border border-border rounded-[18px] p-6 shadow-sm">
@@ -503,7 +567,7 @@
                             </div>
                         </div>
 
-                        {/* ========== SUPPORT TICKETS ========== */}
+                        {/* Support tickets (unchanged) */}
                         <div className="bg-white border border-border rounded-[18px] p-6 shadow-sm">
                             <div className="flex justify-between items-center mb-4">
                                 <h2 className="text-lg font-heading font-bold text-navy">Support Tickets</h2>
@@ -518,9 +582,7 @@
                                     {data.tickets.map((t) => (
                                         <div key={t.id} className="flex justify-between py-3 border-b last:border-0 items-center gap-3">
                                             <div className="min-w-0">
-                                                <p className="font-semibold text-sm text-navy truncate">
-                                                    #{t.id} — {t.subject}
-                                                </p>
+                                                <p className="font-semibold text-sm text-navy truncate">#{t.id} — {t.subject}</p>
                                                 <p className="text-xs text-muted">{t.created_at}</p>
                                             </div>
                                             <TicketStatusBadge status={t.status} label={t.status_display} />
@@ -528,13 +590,11 @@
                                     ))}
                                 </div>
                             ) : (
-                                <p className="text-sm text-muted py-2">
-                                    You haven't opened any tickets yet.
-                                </p>
+                                <p className="text-sm text-muted py-2">You haven't opened any tickets yet.</p>
                             )}
                         </div>
 
-                        {/* ========== SUPPORT BANNER ========== */}
+                        {/* Support banner (unchanged) */}
                         <div className="bg-navy text-white rounded-[18px] p-6 flex flex-col md:flex-row items-center justify-between gap-4 shadow-lg mt-2">
                             <div>
                                 <h2 className="text-lg font-heading font-bold mb-1">Need help?</h2>
@@ -554,14 +614,12 @@
                             <button
                                 onClick={() => setIsTicketOpen(true)}
                                 className="bg-white text-navy font-semibold px-6 py-3 rounded-xl hover:bg-gray-100 w-full md:w-auto transition-colors"
-                            >
-                                Open a ticket
-                            </button>
+                            >Open a ticket</button>
                         </div>
                     </div>
                 </main>
 
-                {/* ============ MOBILE BOTTOM NAV ============ */}
+                {/* Mobile bottom nav (unchanged) */}
                 <div className="fixed bottom-0 left-0 w-full bg-white border-t border-border flex justify-around items-center py-2 px-2 md:hidden z-50 shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.05)]">
                     <a href="#" className="flex flex-col items-center gap-1 text-brand">
                         <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -583,14 +641,13 @@
                     </a>
                 </div>
 
-                {/* ============ TICKET MODAL ============ */}
+                {/* Ticket modal (unchanged) */}
                 <Modal isOpen={isTicketOpen} onClose={() => setIsTicketOpen(false)} title="Open a Support Ticket">
                     <form onSubmit={handleCreateTicket} className="flex flex-col gap-4">
                         <div>
                             <label className="text-sm font-semibold text-navy">Subject</label>
                             <input
-                                type="text"
-                                required
+                                type="text" required
                                 className="w-full border border-border rounded-lg p-3 mt-1 focus:outline-none focus:border-brand"
                                 value={ticketData.subject}
                                 onChange={(e) => setTicketData({ ...ticketData, subject: e.target.value })}
@@ -599,8 +656,7 @@
                         <div>
                             <label className="text-sm font-semibold text-navy">Message</label>
                             <textarea
-                                required
-                                rows="4"
+                                required rows="4"
                                 className="w-full border border-border rounded-lg p-3 mt-1 focus:outline-none focus:border-brand"
                                 value={ticketData.message}
                                 onChange={(e) => setTicketData({ ...ticketData, message: e.target.value })}
@@ -609,9 +665,7 @@
                         <button
                             type="submit"
                             className="bg-brand text-white font-semibold py-3 rounded-xl hover:bg-brand-hover mt-2"
-                        >
-                            Submit Ticket
-                        </button>
+                        >Submit Ticket</button>
                     </form>
                 </Modal>
             </div>

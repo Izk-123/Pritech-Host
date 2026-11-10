@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html>
+<body style="font-family: Arial, sans-serif; background:#F7FAFD; padding:20px; margin:0;">
+  <div style="max-width:600px; margin:0 auto; background:#fff; border-radius:12px; overflow:hidden; border:1px solid #E1EAF2;">
+    <div style="background:#B91C1C; padding:20px; text-align:center;">
+      <h1 style="color:#fff; margin:0; font-size:22px;">Account Suspended</h1>
+    </div>
+    <div style="padding:30px;">
+      <p style="color:#5B6B7C; font-size:16px; line-height:1.5;">
+        Hi {{ customer_name }},<br><br>
+        Your <strong>{{ plan_name }}</strong> account has been suspended because
+        invoice <strong>{{ invoice_number }}</strong> for
+        <strong>MWK {{ amount|floatformat:"0" }}</strong> was not paid.
+      </p>
+      <p style="color:#5B6B7C; font-size:16px; line-height:1.5;">
+        Your files are safe. Pay the invoice to reactivate your account immediately.
+      </p>
+      <div style="text-align:center; margin-top:25px;">
+        <a href="{{ reactivate_url }}" style="background:#1478C4; color:#fff; padding:12px 28px; border-radius:8px; font-weight:bold; text-decoration:none; display:inline-block;">
+          Reactivate Account
+        </a>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

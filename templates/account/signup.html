@@ -10,8 +10,7 @@
     window.SIGNUP_URL = "{% url 'account_signup' %}";
     window.LOGIN_URL = "{% url 'account_login' %}";
     window.GOOGLE_LOGIN_URL = "{% provider_login_url 'google' %}";
-    
-    // Inject Form Errors
+
     window.FORM_ERRORS = {{ form.errors.as_json|safe|default:"{}" }};
 </script>
 
@@ -30,15 +29,14 @@
     const formErrors = window.FORM_ERRORS || {};
 
     function SignupPage() {
-        // Helper to extract errors
         const getError = (field) => {
             return formErrors[field] ? formErrors[field][0].message : null;
         };
 
-        const emailError = getError('email');
+        const emailError     = getError('email');
         const password1Error = getError('password1');
         const password2Error = getError('password2');
-        const generalError = getError('__all__');
+        const generalError   = getError('__all__');
 
         return (
             <div className="min-h-screen bg-bg flex flex-col font-sans text-text">
@@ -51,8 +49,8 @@
                 </header>
 
                 <main className="flex-grow flex items-center justify-center p-4 py-12">
-                    <motion.div 
-                        initial={hasMotion ? { opacity: 0, y: 20 } : {}} 
+                    <motion.div
+                        initial={hasMotion ? { opacity: 0, y: 20 } : {}}
                         animate={hasMotion ? { opacity: 1, y: 0 } : {}}
                         className="bg-white border border-border rounded-[18px] p-8 w-full max-w-md flex flex-col gap-6 shadow-sm"
                     >
@@ -61,14 +59,12 @@
                             <p className="text-muted text-sm">Get started with Pritech Host today.</p>
                         </div>
 
-                        {/* General Errors */}
                         {generalError && (
                             <div className="bg-red-50 text-red-700 border border-red-200 p-4 rounded-xl text-sm font-medium">
                                 {generalError}
                             </div>
                         )}
 
-                        {/* Google Sign-Up Button */}
                         <a href={GOOGLE_LOGIN_URL} className="w-full border border-border rounded-xl py-3 font-semibold text-navy hover:bg-gray-50 flex items-center justify-center gap-2">
                             <svg className="w-5 h-5" viewBox="0 0 24 24">
                                 <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
@@ -85,28 +81,50 @@
                             <div className="flex-1 h-px bg-border"></div>
                         </div>
 
-                        {/* Signup Form */}
                         <form method="POST" action={SIGNUP_URL} className="flex flex-col gap-4">
                             <input type="hidden" name="csrfmiddlewaretoken" value={CSRF_TOKEN} />
-                            
+
                             <div className="flex flex-col gap-1.5">
                                 <label className="text-sm font-semibold text-navy">Email address</label>
-                                <input type="email" name="email" required className={`border rounded-lg p-3 focus:outline-none ${emailError ? 'border-red-500 bg-red-50' : 'border-border focus:border-brand'}`} placeholder="john@example.com" />
+                                <input
+                                    type="email" name="email" required
+                                    className={`border rounded-lg p-3 focus:outline-none ${emailError ? 'border-red-500 bg-red-50' : 'border-border focus:border-brand'}`}
+                                    placeholder="john@example.com"
+                                />
                                 {emailError && <span className="text-xs text-red-600 font-medium">{emailError}</span>}
                             </div>
-                            
+
                             <div className="flex flex-col gap-1.5">
                                 <label className="text-sm font-semibold text-navy">Password</label>
-                                <input type="password" name="password1" required className={`border rounded-lg p-3 focus:outline-none ${password1Error ? 'border-red-500 bg-red-50' : 'border-border focus:border-brand'}`} placeholder="••••••••" />
+                                <input
+                                    type="password" name="password1" required
+                                    className={`border rounded-lg p-3 focus:outline-none ${password1Error ? 'border-red-500 bg-red-50' : 'border-border focus:border-brand'}`}
+                                    placeholder="••••••••"
+                                />
                                 {password1Error && <span className="text-xs text-red-600 font-medium">{password1Error}</span>}
                             </div>
 
                             <div className="flex flex-col gap-1.5">
                                 <label className="text-sm font-semibold text-navy">Confirm Password</label>
-                                <input type="password" name="password2" required className={`border rounded-lg p-3 focus:outline-none ${password2Error ? 'border-red-500 bg-red-50' : 'border-border focus:border-brand'}`} placeholder="••••••••" />
+                                <input
+                                    type="password" name="password2" required
+                                    className={`border rounded-lg p-3 focus:outline-none ${password2Error ? 'border-red-500 bg-red-50' : 'border-border focus:border-brand'}`}
+                                    placeholder="••••••••"
+                                />
                                 {password2Error && <span className="text-xs text-red-600 font-medium">{password2Error}</span>}
                             </div>
-                            
+
+                            {/* ─── Legal acceptance — required before submission ── */}
+                            <label className="flex items-start gap-3 text-sm text-muted">
+                                <input type="checkbox" name="accept_terms" required className="mt-1" />
+                                <span>
+                                    I accept the{' '}
+                                    <a href="/legal/terms/" target="_blank" rel="noopener" className="text-brand underline hover:no-underline">Terms of Service</a>,{' '}
+                                    <a href="/legal/privacy/" target="_blank" rel="noopener" className="text-brand underline hover:no-underline">Privacy Policy</a>, and{' '}
+                                    <a href="/legal/aup/" target="_blank" rel="noopener" className="text-brand underline hover:no-underline">Acceptable Use Policy</a>.
+                                </span>
+                            </label>
+
                             <button type="submit" className="w-full bg-brand text-white font-semibold py-3 rounded-xl hover:bg-brand-hover transition-colors mt-2">
                                 Create Account
                             </button>

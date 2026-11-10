@@ -6,16 +6,18 @@ Sections
 1. Public storefront   — home, checkout, checkout success
 2. Customer dashboard  — dashboard shell, profile shell, JSON APIs
 3. Payment gateway     — PayChangu webhook + browser callbacks
-4. Renewal handling    — extends subscriptions when renewal invoices are paid
+4. Legal documents     — versioned legal pages + cookie consent API
 
 Conventions
 -----------
 * Read-only site content lives on ``SiteSettings`` (exposed as ``site``).
-* Email and Hestia provisioning run **asynchronously** via Celery.
-* Every path that settles a payment (webhook, browser callback, dashboard
-  sync) funnels through ``_handle_renewal_payment()`` so a renewal invoice
-  paid through any path extends the subscription and reactivates the
-  Hestia account. This is idempotent.
+* Email and Hestia provisioning run asynchronously via Celery.
+* Every path that settles a payment funnels through
+  ``_handle_renewal_payment()`` so a renewal invoice paid through any
+  path extends the subscription and reactivates the Hestia account.
+* Legal acceptance is recorded:
+    - at signup     → via core.signals.record_signup_acceptance
+    - at checkout   → inside ``CheckoutView.form_valid`` (below)
 """
 import hashlib
 import hmac
@@ -29,7 +31,7 @@ from django.contrib import messages
 from django.contrib.auth import login
 from django.contrib.auth.mixins import LoginRequiredMixin
 from django.db import transaction
-from django.http import FileResponse, HttpResponse, JsonResponse
+from django.http import FileResponse, Http404, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect
 from django.utils import timezone
 from django.utils.decorators import method_decorator
@@ -50,7 +52,13 @@ from projects.models import Project
 from users.models import CustomerProfile, User
 
 from .forms import CheckoutForm, CustomerProfileForm, UserProfileForm
-from .models import SiteSettings, Ticket
+from .models import (
+    SiteSettings,
+    Ticket,
+    LegalDocument,
+    TermsAcceptance,
+    CookieConsent,
+)
 
 from core.tasks import send_transactional_email_task
 from hosting.tasks import provision_hosting_account_task
@@ -67,28 +75,35 @@ def _human_period(plan: Plan) -> str:
     return 'month' if plan.billing_period == 'monthly' else 'year'
 
 
+def _get_client_ip(request) -> str | None:
+    """
+    Extract the real client IP behind Nginx.
+
+    Nginx sets ``X-Forwarded-For`` to ``client, proxy1, proxy2`` — the
+    leftmost entry is the origin. Used by TermsAcceptance, CookieConsent
+    and signal handlers.
+    """
+    if request is None:
+        return None
+    x_forwarded = request.META.get('HTTP_X_FORWARDED_FOR')
+    if x_forwarded:
+        return x_forwarded.split(',')[0].strip()
+    return request.META.get('REMOTE_ADDR')
+
+
 def _handle_renewal_payment(invoice: Invoice) -> None:
     """
     Extend the linked subscription when a renewal invoice is paid.
 
-    Called from the webhook, the browser callback and the dashboard sync
-    so a renewal is always applied regardless of which path detected the
-    payment first. Idempotent: after this runs once, the subscription's
-    ``renewal_invoice`` is None, so subsequent calls no-op.
-
-    Steps
-    -----
-        1. Extend ``subscription.end_date`` by one billing period.
-        2. ``reset_dunning_flags()`` — clears the whole dunning state.
-        3. Reactivate the Hestia account if it was suspended.
+    Called from the webhook, the browser callback and the dashboard sync.
+    Idempotent: after this runs once, ``renewal_invoice`` is None, so
+    subsequent calls no-op.
     """
     if invoice.invoice_type != 'renewal' or not invoice.subscription_id:
         return
 
     sub = invoice.subscription
 
-    # A cancelled subscription has no live Hestia account to reactivate.
-    # Log loudly so support can resurrect the customer manually.
     if sub.status == 'cancelled':
         logger.error(
             f"[RENEWAL] Payment received for cancelled subscription "
@@ -96,16 +111,10 @@ def _handle_renewal_payment(invoice: Invoice) -> None:
         )
         return
 
-    # --- 1. Extend end_date by one billing period -------------------------
     sub.end_date = sub.end_date + timedelta(days=sub.plan.period_days)
-
-    # --- 2. Clear all dunning state --------------------------------------
-    sub.reset_dunning_flags()   # also sets status='active', is_active=True
-
-    # --- 3. Save ---------------------------------------------------------
+    sub.reset_dunning_flags()
     sub.save()
 
-    # --- 4. Unsuspend Hestia account if needed ---------------------------
     account = HostingAccount.objects.filter(user=sub.user).first()
     if account and account.hestia_username and not account.is_active:
         HestiaCP().unsuspend_user(account.hestia_username)
@@ -120,11 +129,7 @@ def _handle_renewal_payment(invoice: Invoice) -> None:
 
 
 def _post_sync_renewals(user: User) -> None:
-    """
-    Fallback for missed webhooks: after ``sync_pending_payments`` marks
-    any paid-but-pending renewal invoices as paid, apply the renewal
-    extension for each one.
-    """
+    """Fallback for missed webhooks — apply renewal extension if any paid."""
     pending = (
         Subscription.objects
         .filter(user=user, is_active=True, renewal_invoice__isnull=False)
@@ -153,8 +158,9 @@ class CheckoutView(FormView):
     """
     SRS FR-15, FR-63, FR-64 — Checkout flow.
 
-    Creates user (if guest), subscription, project and deposit invoice,
-    then redirects to PayChangu.
+    Records Terms/Privacy/AUP acceptance inside ``form_valid`` — the
+    acceptance is logged at the moment the customer completes checkout,
+    even if the payment itself later fails.
     """
     template_name = 'core/checkout.html'
     form_class = CheckoutForm
@@ -239,8 +245,26 @@ class CheckoutView(FormView):
             total_mwk=deposit_amount,
             is_deposit=True,
             invoice_type='deposit',
-            subscription=subscription,   # link so renewal handler can find it
+            subscription=subscription,
         )
+
+        # --- NEW: record Terms / Privacy / AUP acceptance -----------------
+        # The CheckoutForm has `accept_terms=True` (required=True) so we
+        # only reach this point if the customer actually ticked the box.
+        client_ip = _get_client_ip(self.request)
+        user_agent = self.request.META.get('HTTP_USER_AGENT', '')[:1000]
+
+        for slug in ('terms', 'privacy', 'aup'):
+            doc = LegalDocument.current(slug)
+            if doc:
+                TermsAcceptance.objects.create(
+                    user=user,
+                    document=doc,
+                    context='checkout',
+                    ip_address=client_ip,
+                    user_agent=user_agent,
+                    content_hash=doc.content_hash(),
+                )
 
         # --- Step 3: redirect to gateway ----------------------------------
         checkout_url = PayChanguService.initiate_payment(invoice)
@@ -273,25 +297,21 @@ class DashboardView(LoginRequiredMixin, TemplateView):
 
 class DashboardAPIView(LoginRequiredMixin, View):
     """
-    Single JSON feed powering the React dashboard. Extended with a
-    ``renewal`` block consumed by the renewal warning banner.
+    Single JSON feed powering the React dashboard.
+    Includes a ``renewal`` block consumed by the renewal warning banner.
     """
     def get(self, request, *args, **kwargs):
         user = request.user
         site = SiteSettings.load()
 
-        # --- Missed-webhook recovery --------------------------------------
-        # Marks any paid-but-still-pending invoices as paid, then applies
-        # renewal extension for any renewal invoice that has just settled.
+        # Missed-webhook recovery
         sync_pending_payments(user)
         _post_sync_renewals(user)
 
-        # --- Related rows --------------------------------------------------
         subscription    = Subscription.objects.filter(user=user, is_active=True).first()
         hosting_account = HostingAccount.objects.filter(user=user).first()
         project         = Project.objects.filter(customer=user).order_by('-id').first()
 
-        # --- Hosting status ladder -----------------------------------------
         if hosting_account and hosting_account.is_active:
             hosting_status  = 'active'
             hestia_username = hosting_account.hestia_username
@@ -302,7 +322,6 @@ class DashboardAPIView(LoginRequiredMixin, View):
             hosting_status  = 'pending'
             hestia_username = None
 
-        # --- Usage ---------------------------------------------------------
         usage = {
             'disk_used': 0, 'disk_limit': 0, 'disk_pct': 0,
             'bw_used':   0, 'bw_limit':   0, 'bw_pct':   0,
@@ -317,7 +336,6 @@ class DashboardAPIView(LoginRequiredMixin, View):
             if usage['bw_limit']:
                 usage['bw_pct']   = min(100, int(usage['bw_used']   / usage['bw_limit']   * 100))
 
-        # --- Invoice slices ------------------------------------------------
         invoices     = Invoice.objects.filter(customer=user).order_by('-issue_date')[:5]
         next_invoice = (
             Invoice.objects
@@ -326,11 +344,9 @@ class DashboardAPIView(LoginRequiredMixin, View):
             .first()
         )
 
-        # --- Tickets -------------------------------------------------------
         tickets            = Ticket.objects.filter(user=user).order_by('-created_at')[:5]
         open_tickets_count = Ticket.objects.filter(user=user, status='open').count()
 
-        # --- Renewal context (for the dashboard banner) --------------------
         renewal_info = None
         if subscription:
             renewal_info = {
@@ -353,10 +369,8 @@ class DashboardAPIView(LoginRequiredMixin, View):
                 ),
             }
 
-        # --- Response ------------------------------------------------------
         return JsonResponse({
             'user_name': user.first_name or 'Customer',
-
             'site': {
                 'name':          site.site_name,
                 'cpanel_url':    site.cpanel_url,
@@ -364,7 +378,6 @@ class DashboardAPIView(LoginRequiredMixin, View):
                 'contact_email': site.contact_email,
                 'contact_phone': site.contact_phone,
             },
-
             'subscription': {
                 'plan_name':       subscription.plan.name,
                 'price':           float(subscription.plan.price_mwk),
@@ -375,13 +388,10 @@ class DashboardAPIView(LoginRequiredMixin, View):
                 'email_limit':     subscription.plan.email_accounts,
                 'ssh_access':      subscription.plan.ssh_access,
             } if subscription else None,
-
             'renewal': renewal_info,
-
             'hosting_status':  hosting_status,
             'hestia_username': hestia_username,
             'usage':           usage,
-
             'invoices': [
                 {
                     'id':     inv.id,
@@ -391,21 +401,18 @@ class DashboardAPIView(LoginRequiredMixin, View):
                     'status': inv.status.upper(),
                 } for inv in invoices
             ],
-
             'next_invoice': {
                 'id':       next_invoice.id,
                 'number':   next_invoice.invoice_number,
                 'amount':   float(next_invoice.total_mwk),
                 'due_date': next_invoice.due_date.strftime('%d %b %Y'),
             } if next_invoice else None,
-
             'project': {
                 'stage':         project.stage,
                 'stage_display': project.get_stage_display(),
                 'domain':        project.requested_domain,
                 'total_price':   float(project.total_price_mwk),
             } if project else None,
-
             'tickets': [
                 {
                     'id':             t.id,
@@ -523,25 +530,16 @@ class PayChanguWebhookView(View):
     """
     PayChangu → server notification.
 
-    Flow
-    ----
-        1. Verify the HMAC-SHA256 signature over the raw body.
-        2. Extract invoice id from tx_ref (INV-{id}-{attempt}).
-        3. If already paid → early return (idempotent).
-        4. finalize_invoice_payment(): verify with PayChangu, mark paid once,
-           record the Payment, queue the receipt email + provisioning task.
-        5. If this was a renewal invoice: extend the subscription and
-           reactivate the Hestia account via _handle_renewal_payment().
-        6. Return 200.
+    Verifies the HMAC signature, settles the invoice via
+    ``finalize_invoice_payment``, then triggers the renewal extension
+    if the settled invoice was a renewal.
     """
-
     def post(self, request, *args, **kwargs):
         logger.info(
             "PayChangu Webhook Payload: %s",
             request.body.decode('utf-8', errors='replace'),
         )
 
-        # --- 1. Signature check -------------------------------------------
         signature = request.headers.get('Signature')
         if not signature:
             logger.warning("Webhook: Missing Signature header.")
@@ -564,9 +562,8 @@ class PayChanguWebhookView(View):
         tx_ref = payload.get('reference') or payload.get('tx_ref')
 
         if status != 'success' or not tx_ref:
-            return HttpResponse(status=200)   # ignore non-success events
+            return HttpResponse(status=200)
 
-        # --- 2. Verify with PayChangu and settle the invoice --------------
         invoice, newly_paid = finalize_invoice_payment(tx_ref)
 
         if invoice is None:
@@ -586,10 +583,7 @@ class PayChanguWebhookView(View):
 
 
 class PaymentCallbackView(View):
-    """
-    Browser redirect after successful payment. Same renewal hook as the
-    webhook, so the dashboard is correct by the time it opens.
-    """
+    """Browser redirect after successful payment."""
     def get(self, request, *args, **kwargs):
         tx_ref = request.GET.get('tx_ref')
         if tx_ref and request.GET.get('status', 'success') == 'success':
@@ -606,3 +600,84 @@ class PaymentReturnView(View):
     """Browser redirect after a failed/cancelled payment."""
     def get(self, request, *args, **kwargs):
         return redirect('/dashboard/?payment=failed')
+
+
+# ==============================================================================
+# 4. LEGAL DOCUMENTS
+# ==============================================================================
+
+class LegalDocumentView(TemplateView):
+    """
+    Render any active legal document by slug.
+
+    Valid slugs: ``terms``, ``privacy``, ``aup``, ``refund``. The
+    sidebar tab switcher is populated from ``LegalDocument.SLUG_CHOICES``
+    and only includes tabs for documents that actually exist (so a
+    missing AUP doesn't render a broken tab).
+    """
+    template_name = 'core/legal/document.html'
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        slug = self.kwargs['slug']
+
+        doc = LegalDocument.current(slug)
+        if not doc:
+            raise Http404(f"Legal document '{slug}' not found.")
+
+        # Only include tabs whose documents exist.
+        available_tabs = []
+        for tab_slug, tab_label in LegalDocument.SLUG_CHOICES:
+            if LegalDocument.current(tab_slug) is not None:
+                available_tabs.append((tab_slug, tab_label))
+
+        context['document']       = doc
+        context['active_slug']    = slug
+        context['available_tabs'] = available_tabs
+        return context
+
+
+# ==============================================================================
+# 5. COOKIE CONSENT API
+# ==============================================================================
+
+@method_decorator(csrf_exempt, name='dispatch')
+class CookieConsentAPIView(View):
+    """
+    Records cookie banner consent from the AJAX banner.
+
+    CSRF-exempt so the banner works for anonymous visitors who haven't
+    established a session yet. This endpoint only stores consent flags
+    keyed by session_key — it does not grant any privilege, so exemption
+    is low-risk. Idempotent: re-submitting for the same session updates
+    the existing row.
+    """
+    def post(self, request, *args, **kwargs):
+        try:
+            data = json.loads(request.body)
+        except json.JSONDecodeError:
+            return JsonResponse({'error': 'Invalid JSON'}, status=400)
+
+        categories = data.get('categories', {})
+        if not isinstance(categories, dict):
+            return JsonResponse({'error': 'categories must be an object'}, status=400)
+
+        # Ensure a session exists so we have a stable key.
+        if not request.session.session_key:
+            request.session.create()
+
+        CookieConsent.objects.update_or_create(
+            session_key=request.session.session_key,
+            defaults={
+                'user':       request.user if request.user.is_authenticated else None,
+                'ip_address': _get_client_ip(request),
+                'user_agent': request.META.get('HTTP_USER_AGENT', '')[:1000],
+                'categories': categories,
+            },
+        )
+
+        # Also flag in session so the banner doesn't reappear (belt and
+        # braces — the banner primarily uses localStorage).
+        request.session['cookie_consent_given'] = True
+
+        return JsonResponse({'success': True})

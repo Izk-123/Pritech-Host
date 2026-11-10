@@ -4,13 +4,16 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+
+    <!-- CSRF token exposed for React AJAX calls (cookie banner, etc.) -->
+    <meta name="csrf-token" content="{{ csrf_token }}">
+
     <title>Pritech Host</title>
-    
-    <!-- Favicon -->
+
     <link rel="icon" type="image/png" href="{% static 'images/pritech_host_icon.png' %}">
 
     <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
-    
+
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         tailwind.config = {
@@ -36,12 +39,175 @@
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-    
-    <!-- FIXED: Framer Motion v10 (has UMD build) -->
+
+    <!-- Framer Motion v10 (UMD build) -->
     <script src="https://cdn.jsdelivr.net/npm/framer-motion@10.16.16/dist/framer-motion.min.js"></script>
 </head>
 <body class="bg-bg text-text font-sans antialiased">
     <div id="root"></div>
     {% block react_code %}{% endblock %}
+
+    <!-- ==================================================================
+         Cookie consent banner — independent React root at #cookie-root.
+         Rendered on every page that extends base.html. Reads/writes
+         localStorage for instant UX; POSTs to /api/cookie-consent/ for
+         the server-side audit trail (fire-and-forget, never blocks UI).
+         ================================================================== -->
+    <div id="cookie-root"></div>
+
+    {% verbatim %}
+    <script type="text/babel">
+        const COOKIE_STORAGE_KEY = 'pritech_cookie_consent_v1';
+        const CSRF_TOKEN = document.querySelector('meta[name="csrf-token"]')?.content || '';
+
+        function CookieBanner() {
+            const [visible, setVisible] = React.useState(false);
+            const [showDetails, setShowDetails] = React.useState(false);
+            const [prefs, setPrefs] = React.useState({
+                necessary: true,       // always on, cannot be disabled
+                analytics: false,
+                marketing: false,
+            });
+
+            React.useEffect(() => {
+                // Small delay so the banner doesn't flash during page paint
+                if (!localStorage.getItem(COOKIE_STORAGE_KEY)) {
+                    setTimeout(() => setVisible(true), 800);
+                }
+            }, []);
+
+            const submit = (categories) => {
+                // 1. Instant UX: store locally so the banner stays hidden
+                localStorage.setItem(COOKIE_STORAGE_KEY, JSON.stringify(categories));
+
+                // 2. Audit trail: POST to the server (fire-and-forget)
+                fetch('/api/cookie-consent/', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-CSRFToken': CSRF_TOKEN,
+                    },
+                    body: JSON.stringify({ categories }),
+                }).catch(() => { /* never block the user */ });
+
+                setVisible(false);
+            };
+
+            const acceptAll = () => {
+                const all = { necessary: true, analytics: true, marketing: true };
+                setPrefs(all);
+                submit(all);
+            };
+
+            const acceptNecessary = () => {
+                const minimal = { necessary: true, analytics: false, marketing: false };
+                setPrefs(minimal);
+                submit(minimal);
+            };
+
+            const savePrefs = () => submit(prefs);
+
+            if (!visible) return null;
+
+            return (
+                <div style={{
+                    position: 'fixed', left: 0, right: 0, bottom: 0, zIndex: 9999,
+                    padding: '16px', pointerEvents: 'none',
+                }}>
+                    <div style={{
+                        pointerEvents: 'auto',
+                        maxWidth: '960px',
+                        margin: '0 auto',
+                        background: '#fff',
+                        border: '1px solid #E1EAF2',
+                        borderRadius: '18px',
+                        boxShadow: '0 20px 40px -10px rgba(14,34,56,0.18)',
+                        padding: '20px 24px',
+                        fontFamily: 'Inter, sans-serif',
+                    }}>
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '16px', alignItems: 'flex-start' }}>
+                            <div style={{ flex: '1 1 320px', minWidth: 0 }}>
+                                <p style={{ margin: 0, fontFamily: 'Poppins, sans-serif', fontWeight: 700, fontSize: '16px', color: '#16365F' }}>
+                                    We use cookies
+                                </p>
+                                <p style={{ margin: '6px 0 0', color: '#5B6B7C', fontSize: '14px', lineHeight: 1.5 }}>
+                                    We use necessary cookies to run the site, and optional cookies to
+                                    understand usage. You can accept all, or manage preferences.{' '}
+                                    <a href="/legal/privacy/" style={{ color: '#1478C4', textDecoration: 'underline' }}>
+                                        Learn more
+                                    </a>
+                                </p>
+                            </div>
+
+                            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
+                                <button onClick={acceptNecessary} style={{
+                                    padding: '10px 18px', borderRadius: '10px',
+                                    background: '#fff', color: '#16365F',
+                                    border: '1.5px solid #C9D8E6', fontWeight: 600,
+                                    fontSize: '14px', cursor: 'pointer',
+                                }}>
+                                    Necessary only
+                                </button>
+                                <button onClick={() => setShowDetails(!showDetails)} style={{
+                                    padding: '10px 18px', borderRadius: '10px',
+                                    background: '#fff', color: '#16365F',
+                                    border: '1.5px solid #C9D8E6', fontWeight: 600,
+                                    fontSize: '14px', cursor: 'pointer',
+                                }}>
+                                    {showDetails ? 'Hide options' : 'Customize'}
+                                </button>
+                                <button onClick={acceptAll} style={{
+                                    padding: '10px 18px', borderRadius: '10px',
+                                    background: '#1478C4', color: '#fff',
+                                    border: 'none', fontWeight: 600,
+                                    fontSize: '14px', cursor: 'pointer',
+                                }}>
+                                    Accept all
+                                </button>
+                            </div>
+                        </div>
+
+                        {showDetails && (
+                            <div style={{ marginTop: '16px', paddingTop: '16px', borderTop: '1px solid #E1EAF2', display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                                <label style={{ display: 'flex', alignItems: 'center', gap: '10px', fontSize: '14px', color: '#5B6B7C' }}>
+                                    <input type="checkbox" checked disabled />
+                                    <span><strong style={{ color: '#16365F' }}>Necessary</strong> — required for login, payments, security. Always on.</span>
+                                </label>
+                                <label style={{ display: 'flex', alignItems: 'center', gap: '10px', fontSize: '14px', color: '#5B6B7C', cursor: 'pointer' }}>
+                                    <input
+                                        type="checkbox"
+                                        checked={prefs.analytics}
+                                        onChange={(e) => setPrefs({ ...prefs, analytics: e.target.checked })}
+                                    />
+                                    <span><strong style={{ color: '#16365F' }}>Analytics</strong> — anonymous usage stats to improve the site.</span>
+                                </label>
+                                <label style={{ display: 'flex', alignItems: 'center', gap: '10px', fontSize: '14px', color: '#5B6B7C', cursor: 'pointer' }}>
+                                    <input
+                                        type="checkbox"
+                                        checked={prefs.marketing}
+                                        onChange={(e) => setPrefs({ ...prefs, marketing: e.target.checked })}
+                                    />
+                                    <span><strong style={{ color: '#16365F' }}>Marketing</strong> — we don't currently use these.</span>
+                                </label>
+                                <button onClick={savePrefs} style={{
+                                    marginTop: '8px', alignSelf: 'flex-start',
+                                    padding: '10px 18px', borderRadius: '10px',
+                                    background: '#16365F', color: '#fff',
+                                    border: 'none', fontWeight: 600,
+                                    fontSize: '14px', cursor: 'pointer',
+                                }}>
+                                    Save preferences
+                                </button>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        }
+
+        const cookieRoot = ReactDOM.createRoot(document.getElementById('cookie-root'));
+        cookieRoot.render(<CookieBanner />);
+    </script>
+    {% endverbatim %}
 </body>
 </html>

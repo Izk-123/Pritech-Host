@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html>
+<body style="font-family: Arial, sans-serif; background:#F7FAFD; padding:20px; margin:0;">
+  <div style="max-width:600px; margin:0 auto; background:#fff; border-radius:12px; overflow:hidden; border:1px solid #E1EAF2;">
+
+    <div style="background:#16365F; padding:20px; text-align:center;">
+      <h1 style="color:#fff; margin:0; font-size:22px;">Pritech Host</h1>
+    </div>
+
+    <div style="padding:30px;">
+
+      {% if stage == '30d' %}
+        <h2 style="color:#16365F; margin-top:0;">Heads-up: renewal in 30 days</h2>
+        <p style="color:#5B6B7C; font-size:16px; line-height:1.5;">
+          Hi {{ customer_name }},<br><br>
+          Your <strong>{{ plan_name }}</strong> plan renews on <strong>{{ end_date }}</strong>.
+          No action needed today — we'll send your invoice shortly.
+        </p>
+      {% elif stage == '14d' %}
+        <h2 style="color:#16365F; margin-top:0;">Your renewal invoice is ready</h2>
+        <p style="color:#5B6B7C; font-size:16px; line-height:1.5;">
+          Hi {{ customer_name }},<br><br>
+          Invoice <strong>{{ invoice_number }}</strong> for <strong>MWK {{ amount|floatformat:"0" }}</strong>
+          is ready. It covers the period starting <strong>{{ end_date }}</strong>.
+        </p>
+      {% elif stage == '7d' %}
+        <h2 style="color:#16365F; margin-top:0;">Reminder: 7 days to renewal</h2>
+        <p style="color:#5B6B7C; font-size:16px; line-height:1.5;">
+          Hi {{ customer_name }},<br><br>
+          Your <strong>{{ plan_name }}</strong> plan renews on <strong>{{ end_date }}</strong>.
+          Please pay invoice <strong>{{ invoice_number }}</strong> before then.
+        </p>
+      {% elif stage == '3d' %}
+        <h2 style="color:#16365F; margin-top:0;">3 days until your plan expires</h2>
+        <p style="color:#5B6B7C; font-size:16px; line-height:1.5;">
+          Hi {{ customer_name }},<br><br>
+          Your plan expires on <strong>{{ end_date }}</strong>. Renew now to avoid any
+          interruption to your hosting.
+        </p>
+      {% elif stage == '1d' %}
+        <h2 style="color:#16365F; margin-top:0;">Final reminder: expires tomorrow</h2>
+        <p style="color:#5B6B7C; font-size:16px; line-height:1.5;">
+          Hi {{ customer_name }},<br><br>
+          Your <strong>{{ plan_name }}</strong> plan expires <strong>tomorrow</strong>.
+          Pay now to keep your website online.
+        </p>
+      {% elif stage == 'expired' %}
+        <h2 style="color:#B45309; margin-top:0;">Your plan has expired</h2>
+        <p style="color:#5B6B7C; font-size:16px; line-height:1.5;">
+          Hi {{ customer_name }},<br><br>
+          Your plan expired on <strong>{{ end_date }}</strong>. You still have
+          <strong>7 days</strong> before your account is suspended.
+        </p>
+      {% elif stage == 'suspension_warning' %}
+        <h2 style="color:#B91C1C; margin-top:0;">Suspension in 24 hours</h2>
+        <p style="color:#5B6B7C; font-size:16px; line-height:1.5;">
+          Hi {{ customer_name }},<br><br>
+          Your account will be <strong>suspended in 24 hours</strong> unless
+          invoice <strong>{{ invoice_number }}</strong> is paid.
+        </p>
+      {% elif stage == 'final_warning' %}
+        <h2 style="color:#B91C1C; margin-top:0;">Final notice: deletion in 15 days</h2>
+        <p style="color:#5B6B7C; font-size:16px; line-height:1.5;">
+          Hi {{ customer_name }},<br><br>
+          Your account has been suspended for 30 days. In <strong>15 days</strong>,
+          your account and all files will be permanently deleted.
+        </p>
+      {% endif %}
+
+      {% if invoice_number %}
+        <div style="background:#F7FAFD; border:1px solid #E1EAF2; border-radius:8px; padding:15px; margin:20px 0;">
+          <p style="margin:5px 0; color:#16365F;"><strong>Invoice:</strong> {{ invoice_number }}</p>
+          <p style="margin:5px 0; color:#16365F;"><strong>Amount:</strong> MWK {{ amount|floatformat:"0" }}</p>
+          <p style="margin:5px 0; color:#16365F;"><strong>Renewal date:</strong> {{ end_date }}</p>
+        </div>
+
+        <div style="text-align:center; margin-top:25px;">
+          <a href="{{ pay_url }}" style="background:#1478C4; color:#fff; padding:12px 28px; border-radius:8px; font-weight:bold; text-decoration:none; display:inline-block;">
+            Pay {{ amount|floatformat:"0" }} MWK Now
+          </a>
+        </div>
+      {% endif %}
+
+      <p style="color:#9CA3AF; font-size:13px; margin-top:30px; text-align:center;">
+        You can manage your account any time at <a href="{{ dashboard_url }}" style="color:#1478C4;">{{ dashboard_url }}</a>.
+      </p>
+    </div>
+
+    <div style="background:#F7FAFD; padding:15px; text-align:center; color:#9CA3AF; font-size:12px;">
+      &copy; 2026 Pritech ICT Solutions. All rights reserved.
+    </div>
+  </div>
+</body>
+</html>

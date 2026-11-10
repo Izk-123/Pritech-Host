@@ -11,10 +11,8 @@
     window.PRITECH_LOGO_URL = "{% static 'images/pritech-logo.svg' %}";
     window.CSRF_TOKEN       = "{{ csrf_token }}";
 
-    // Auth state.
     window.IS_AUTHENTICATED = {% if request.user.is_authenticated %}true{% else %}false{% endif %};
 
-    // Pre-fill for logged-in users.
     window.USER_DATA = {
         email:         "{{ request.user.email|default:''|escapejs }}",
         first_name:    "{{ request.user.first_name|default:''|escapejs }}",
@@ -24,20 +22,16 @@
         gender:        "{{ request.user.gender|default:''|escapejs }}"
     };
 
-    // Google OAuth (returns to this same page after auth).
     window.GOOGLE_LOGIN_URL = "{% provider_login_url 'google' next=request.path %}";
 
-    // Site-wide content (SiteSettings via context processor).
     window.SITE = {
         name:  "{{ site.site_name|escapejs }}",
         email: "{{ site.contact_email|escapejs }}",
         phone: "{{ site.contact_phone|escapejs }}"
     };
 
-    // Singular billing period for this plan ("month" or "year").
     window.PLAN_BILLING_PERIOD = "{{ billing_period|default:'year'|escapejs }}";
 
-    // Django messages & form field errors.
     window.DJANGO_MESSAGES = [
         {% for message in messages %}
         { "tags": "{{ message.tags }}", "message": "{{ message|escapejs }}" }{% if not forloop.last %},{% endif %}
@@ -46,24 +40,17 @@
     window.FORM_ERRORS = {{ form.errors.as_json|safe|default:"{}" }};
 </script>
 
-<!-- =============================================================
-     2. Plan pricing (JSON so JS can parse cleanly)
-     ============================================================= -->
 {{ plan.name|json_script:"plan-name" }}
 {{ plan.price_mwk|json_script:"plan-price" }}
 {{ deposit_amount|json_script:"deposit-amount" }}
 {{ balance_amount|json_script:"balance-amount" }}
 
-<!-- =============================================================
-     3. React
-     ============================================================= -->
 {% verbatim %}
 <script type="text/babel">
     const hasMotion      = !!window.Motion;
     const motion         = hasMotion ? window.Motion.motion : { div: (props) => <div {...props} /> };
     const AnimatePresence = hasMotion ? window.Motion.AnimatePresence : ({ children }) => <>{children}</>;
 
-    // Safe JSON parse helper for the hidden data script tags.
     function safeJson(id, fallback) {
         try {
             const el = document.getElementById(id);
@@ -71,13 +58,11 @@
         } catch (e) { return fallback; }
     }
 
-    // Parsed plan figures.
     const planName      = safeJson('plan-name', 'Package');
     const planPrice     = parseFloat(safeJson('plan-price', 0)) || 0;
     const depositAmount = parseFloat(safeJson('deposit-amount', 0)) || 0;
     const balanceAmount = parseFloat(safeJson('balance-amount', 0)) || 0;
 
-    // Globals.
     const LOGO_URL         = window.PRITECH_LOGO_URL;
     const CSRF_TOKEN       = window.CSRF_TOKEN;
     const IS_AUTHENTICATED = window.IS_AUTHENTICATED;
@@ -89,7 +74,6 @@
     const djangoMessages = window.DJANGO_MESSAGES || [];
     const formErrors     = window.FORM_ERRORS || {};
 
-    // MWK formatter — no decimals for cleaner display.
     const fmt = (num) => {
         if (isNaN(num)) return 'MWK 0';
         return new Intl.NumberFormat('en-MW', {
@@ -97,15 +81,11 @@
         }).format(num);
     };
 
-    // Extract a single field error message from Django's as_json output.
     const getFieldError = (fieldName) => {
         const errs = formErrors[fieldName];
         return errs && errs.length > 0 ? errs[0].message : null;
     };
 
-    // ==================================================================
-    // Checkout page
-    // ==================================================================
     function CheckoutPage() {
         const emailError = getFieldError('email');
         const phoneError = getFieldError('phone_number');
@@ -117,8 +97,6 @@
 
         return (
             <div className="min-h-screen bg-bg flex flex-col font-sans text-text">
-
-                {/* ---------- Header ---------- */}
                 <header className="bg-white border-b border-border px-4 py-4">
                     <div className="max-w-[1100px] mx-auto flex items-center">
                         <img src={LOGO_URL} alt={SITE.name} className="h-[34px] object-contain" />
@@ -126,8 +104,6 @@
                 </header>
 
                 <main className="flex-grow max-w-[1100px] mx-auto w-full px-4 py-8 flex flex-col gap-8">
-
-                    {/* ---------- Progress ---------- */}
                     <div className="flex items-center gap-3 md:gap-6 text-sm font-semibold text-brand">
                         <div className="flex items-center gap-2 opacity-50">
                             <span className="w-7 h-7 rounded-full bg-brand text-white flex items-center justify-center text-xs">1</span>
@@ -143,15 +119,12 @@
                         </div>
                     </div>
 
-                    {/* ---------- Form + Order summary ---------- */}
                     <form method="POST" action="" className="flex flex-col lg:flex-row gap-6 items-start w-full">
                         <input type="hidden" name="csrfmiddlewaretoken" value={CSRF_TOKEN} />
 
-                        {/* ==================== Details column ==================== */}
                         <div className="flex-1 w-full bg-white border border-border rounded-[18px] p-6 flex flex-col gap-5">
                             <h1 className="text-2xl font-heading font-bold text-navy">Your details</h1>
 
-                            {/* Server-side messages (info / error banners). */}
                             <AnimatePresence>
                                 {djangoMessages.map((msg, index) => (
                                     <motion.div
@@ -165,7 +138,6 @@
                                 ))}
                             </AnimatePresence>
 
-                            {/* Google login — guests only. */}
                             {!IS_AUTHENTICATED && (
                                 <>
                                     <a
@@ -188,36 +160,20 @@
                                 </>
                             )}
 
-                            {/* Core identity fields */}
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                                 <div className="flex flex-col gap-1.5">
                                     <label className="text-sm font-semibold text-navy">Full name</label>
-                                    <input
-                                        type="text"
-                                        name="first_name"
-                                        required
-                                        className="border border-border rounded-lg p-3 focus:outline-none focus:border-brand"
-                                        defaultValue={USER_DATA.first_name}
-                                    />
+                                    <input type="text" name="first_name" required className="border border-border rounded-lg p-3 focus:outline-none focus:border-brand" defaultValue={USER_DATA.first_name} />
                                 </div>
                                 <div className="flex flex-col gap-1.5">
                                     <label className="text-sm font-semibold text-navy">Phone number</label>
-                                    <input
-                                        type="tel"
-                                        name="phone_number"
-                                        required
-                                        className={`border rounded-lg p-3 focus:outline-none ${phoneError ? 'border-red-500 bg-red-50' : 'border-border focus:border-brand'}`}
-                                        defaultValue={USER_DATA.phone_number}
-                                    />
+                                    <input type="tel" name="phone_number" required className={`border rounded-lg p-3 focus:outline-none ${phoneError ? 'border-red-500 bg-red-50' : 'border-border focus:border-brand'}`} defaultValue={USER_DATA.phone_number} />
                                     {phoneError && <span className="text-xs text-red-600">{phoneError}</span>}
                                 </div>
                                 <div className="flex flex-col gap-1.5">
                                     <label className="text-sm font-semibold text-navy">Email address</label>
                                     <input
-                                        type="email"
-                                        name="email"
-                                        required
-                                        readOnly={IS_AUTHENTICATED}
+                                        type="email" name="email" required readOnly={IS_AUTHENTICATED}
                                         className={`border rounded-lg p-3 focus:outline-none ${
                                             emailError ? 'border-red-500 bg-red-50'
                                             : IS_AUTHENTICATED ? 'border-border bg-gray-100 text-muted'
@@ -229,52 +185,27 @@
                                 </div>
                                 <div className="flex flex-col gap-1.5">
                                     <label className="text-sm font-semibold text-navy">Date of birth</label>
-                                    <input
-                                        type="date"
-                                        name="date_of_birth"
-                                        required
-                                        className="border border-border rounded-lg p-3 focus:outline-none focus:border-brand"
-                                        defaultValue={USER_DATA.date_of_birth}
-                                    />
+                                    <input type="date" name="date_of_birth" required className="border border-border rounded-lg p-3 focus:outline-none focus:border-brand" defaultValue={USER_DATA.date_of_birth} />
                                 </div>
                             </div>
 
-                            {/* Gender radios */}
                             <div className="flex flex-col gap-2">
                                 <label className="text-sm font-semibold text-navy">Gender</label>
                                 <div className="flex gap-4">
                                     <label className="flex items-center gap-2 text-sm">
-                                        <input
-                                            type="radio"
-                                            name="gender"
-                                            value="M"
-                                            required
-                                            defaultChecked={USER_DATA.gender === 'M' || !USER_DATA.gender}
-                                        /> Male
+                                        <input type="radio" name="gender" value="M" required defaultChecked={USER_DATA.gender === 'M' || !USER_DATA.gender} /> Male
                                     </label>
                                     <label className="flex items-center gap-2 text-sm">
-                                        <input
-                                            type="radio"
-                                            name="gender"
-                                            value="F"
-                                            required
-                                            defaultChecked={USER_DATA.gender === 'F'}
-                                        /> Female
+                                        <input type="radio" name="gender" value="F" required defaultChecked={USER_DATA.gender === 'F'} /> Female
                                     </label>
                                 </div>
                             </div>
 
-                            {/* Optional company */}
                             <div className="flex flex-col gap-1.5">
                                 <label className="text-sm font-semibold text-navy">Company (optional)</label>
-                                <input
-                                    type="text"
-                                    name="company_name"
-                                    className="border border-border rounded-lg p-3 focus:outline-none focus:border-brand"
-                                />
+                                <input type="text" name="company_name" className="border border-border rounded-lg p-3 focus:outline-none focus:border-brand" />
                             </div>
 
-                            {/* Payment method */}
                             <h2 className="text-xl font-heading font-bold text-navy mt-4">Payment method</h2>
                             <div className="flex flex-col gap-3">
                                 <label className="flex items-center justify-between border-2 border-brand rounded-xl p-4 cursor-pointer">
@@ -297,21 +228,28 @@
                                 </label>
                             </div>
 
-                            {/* Terms */}
+                            {/* ─── Terms acceptance with real legal links ───────────── */}
                             <label className="flex items-start gap-3 text-sm text-muted mt-2">
                                 <input type="checkbox" name="accept_terms" required className="mt-1" />
-                                I accept the terms of service and privacy policy.
+                                <span>
+                                    I accept the{' '}
+                                    <a href="/legal/terms/" target="_blank" rel="noopener" className="text-brand underline hover:no-underline">
+                                        Terms of Service
+                                    </a>,{' '}
+                                    <a href="/legal/privacy/" target="_blank" rel="noopener" className="text-brand underline hover:no-underline">
+                                        Privacy Policy
+                                    </a>, and{' '}
+                                    <a href="/legal/aup/" target="_blank" rel="noopener" className="text-brand underline hover:no-underline">
+                                        Acceptable Use Policy
+                                    </a>.
+                                </span>
                             </label>
 
-                            <button
-                                type="submit"
-                                className="w-full bg-brand text-white font-semibold py-4 rounded-xl hover:bg-brand-hover transition-colors mt-2"
-                            >
+                            <button type="submit" className="w-full bg-brand text-white font-semibold py-4 rounded-xl hover:bg-brand-hover transition-colors mt-2">
                                 Pay deposit {fmt(depositAmount)}
                             </button>
                         </div>
 
-                        {/* ==================== Order summary column ==================== */}
                         <div className="w-full lg:w-[380px] bg-white border border-border rounded-[18px] p-6 flex flex-col gap-5">
                             <h2 className="text-xl font-heading font-bold text-navy">Order summary</h2>
 
@@ -320,7 +258,6 @@
                                 <span>{fmt(planPrice)}</span>
                             </div>
 
-                            {/* Billing period is dynamic per plan. */}
                             <p className="text-xs text-muted -mt-3">
                                 Billed {billingPeriod}. Includes hosting and email.
                             </p>
@@ -328,8 +265,7 @@
                             <div className="flex flex-col gap-1.5">
                                 <label className="text-sm font-semibold text-navy">Domain you want</label>
                                 <input
-                                    type="text"
-                                    name="requested_domain"
+                                    type="text" name="requested_domain"
                                     className="border border-border rounded-lg p-3 text-sm focus:outline-none focus:border-brand"
                                     placeholder="yourbusiness.com"
                                 />

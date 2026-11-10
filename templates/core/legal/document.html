@@ -1,0 +1,149 @@
+{% extends 'base.html' %}
+{% load static %}
+
+{% block react_code %}
+<script>
+    window.PRITECH_LOGO_URL = "{% static 'images/pritech-logo.svg' %}";
+    window.DOC = {
+        slug:    "{{ document.slug|escapejs }}",
+        title:   "{{ document.title|escapejs }}",
+        version: "{{ document.version|escapejs }}",
+        effective: "{{ document.effective_date|date:'d F Y'|escapejs }}",
+        content: {{ document.content|json_script:"doc-content" }},
+    };
+    window.TABS = [
+        { slug: 'terms',   label: 'Terms of Service',  url: "{% url 'core:legal_document' 'terms' %}",   active: {% if active_slug == 'terms' %}true{% else %}false{% endif %} },
+        { slug: 'privacy', label: 'Privacy Policy',    url: "{% url 'core:legal_document' 'privacy' %}", active: {% if active_slug == 'privacy' %}true{% else %}false{% endif %} },
+        { slug: 'aup',     label: 'Acceptable Use',    url: "{% url 'core:legal_document' 'aup' %}",     active: {% if active_slug == 'aup' %}true{% else %}false{% endif %} },
+        { slug: 'refund',  label: 'Refund Policy',     url: "{% url 'core:legal_document' 'refund' %}",  active: {% if active_slug == 'refund' %}true{% else %}false{% endif %} },
+    ];
+</script>
+
+{% verbatim %}
+<script type="text/babel">
+    const hasMotion = !!window.Motion;
+    const motion = hasMotion ? window.Motion.motion : { div: (props) => <div {...props} /> };
+
+    const LOGO_URL = window.PRITECH_LOGO_URL;
+    const DOC = window.DOC;
+    const TABS = window.TABS;
+    // document.content comes in as JSON string from json_script
+    const CONTENT_HTML = JSON.parse(document.getElementById('doc-content').textContent);
+
+    function LegalPage() {
+        return (
+            <div className="min-h-screen bg-bg flex flex-col font-sans text-text">
+                <header className="bg-white border-b border-border px-4 py-3 sticky top-0 z-40">
+                    <div className="max-w-[1100px] mx-auto flex items-center justify-between gap-4">
+                        <a href="/">
+                            <img src={LOGO_URL} alt="Pritech Host" className="h-[34px] md:h-[44px] object-contain" />
+                        </a>
+                        <a href="/" className="text-sm font-semibold text-brand hover:underline">
+                            ← Back to home
+                        </a>
+                    </div>
+                </header>
+
+                <main className="flex-grow max-w-[1100px] mx-auto w-full px-4 py-8 md:py-12">
+                    <div className="grid grid-cols-1 md:grid-cols-4 gap-8">
+
+                        {/* Sidebar tabs */}
+                        <nav className="md:col-span-1">
+                            <p className="text-xs font-bold text-muted uppercase tracking-wide mb-3">Legal</p>
+                            <div className="flex md:flex-col gap-2 overflow-x-auto md:overflow-visible pb-2 md:pb-0">
+                                {TABS.map((tab) => (
+                                    <a
+                                        key={tab.slug}
+                                        href={tab.url}
+                                        className={`whitespace-nowrap px-4 py-2.5 rounded-xl text-sm font-medium transition-colors ${
+                                            tab.active
+                                                ? 'bg-brand text-white shadow-sm'
+                                                : 'bg-white border border-border text-navy hover:bg-gray-50'
+                                        }`}
+                                    >
+                                        {tab.label}
+                                    </a>
+                                ))}
+                            </div>
+                        </nav>
+
+                        {/* Document body */}
+                        <article className="md:col-span-3 bg-white border border-border rounded-[18px] p-6 md:p-10 shadow-sm">
+                            <div className="mb-8 pb-6 border-b border-border">
+                                <h1 className="text-2xl md:text-3xl font-heading font-bold text-navy mb-2">
+                                    {DOC.title}
+                                </h1>
+                                <p className="text-sm text-muted">
+                                    Version {DOC.version} · Effective {DOC.effective}
+                                </p>
+                            </div>
+
+                            <div
+                                className="prose-legal max-w-none text-text leading-relaxed"
+                                dangerouslySetInnerHTML={{ __html: CONTENT_HTML }}
+                            />
+
+                            <div className="mt-12 pt-6 border-t border-border text-xs text-muted">
+                                <p>
+                                    Pritech ICT Solutions · Area 51/24 Kanengo, Lilongwe, Malawi ·
+                                    <a href="mailto:info@pritechmw.com" className="text-brand hover:underline ml-1">info@pritechmw.com</a>
+                                </p>
+                            </div>
+                        </article>
+                    </div>
+                </main>
+
+                {/* Typography styles for the injected HTML */}
+                <style>{`
+                    .prose-legal h2 {
+                        font-family: Poppins, sans-serif;
+                        font-size: 1.375rem;
+                        font-weight: 700;
+                        color: #16365F;
+                        margin-top: 2rem;
+                        margin-bottom: 0.75rem;
+                        line-height: 1.3;
+                    }
+                    .prose-legal h3 {
+                        font-family: Poppins, sans-serif;
+                        font-size: 1.0625rem;
+                        font-weight: 600;
+                        color: #16365F;
+                        margin-top: 1.5rem;
+                        margin-bottom: 0.5rem;
+                    }
+                    .prose-legal p {
+                        color: #0E2238;
+                        margin-bottom: 1rem;
+                        line-height: 1.7;
+                    }
+                    .prose-legal ul, .prose-legal ol {
+                        margin: 0.75rem 0 1rem 1.5rem;
+                    }
+                    .prose-legal li {
+                        margin-bottom: 0.5rem;
+                        line-height: 1.6;
+                    }
+                    .prose-legal strong {
+                        color: #16365F;
+                        font-weight: 600;
+                    }
+                    .prose-legal a {
+                        color: #1478C4;
+                        text-decoration: underline;
+                    }
+                    @media print {
+                        body { background: white; }
+                        header, nav, footer { display: none !important; }
+                        article { border: none; padding: 0; box-shadow: none; }
+                    }
+                `}</style>
+            </div>
+        );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<LegalPage />);
+</script>
+{% endverbatim %}
+{% endblock %}

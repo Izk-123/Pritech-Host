@@ -12,7 +12,6 @@
     };
     window.IS_AUTHENTICATED = {% if request.user.is_authenticated %}true{% else %}false{% endif %};
 
-    // Site-wide content, editable via /admin/ → Site Settings.
     window.SITE = {
         name:              "{{ site.site_name|escapejs }}",
         email:             "{{ site.contact_email|escapejs }}",
@@ -25,7 +24,6 @@
     };
 </script>
 
-{# Plan cards come from Plan rows — fully data-driven. #}
 <script id="plans-data" type="application/json">
     [
         {% for plan in plans %}
@@ -46,35 +44,27 @@
     ]
 </script>
 
-{# Hero preview card rows (label / value pairs, admin-editable). #}
 {{ site.preview_features|json_script:"preview-features" }}
 
 {% verbatim %}
 <script type="text/babel">
     const { useState } = React;
 
-    // Motion shim – falls back gracefully if Framer Motion failed to load.
     const hasMotion = !!window.Motion;
     const motion = hasMotion ? window.Motion.motion : { div: (props) => <div {...props} /> };
     const AnimatePresence = hasMotion ? window.Motion.AnimatePresence : ({ children }) => <>{children}</>;
 
-    // Data parsed from the JSON script tags above.
     const plansData       = JSON.parse(document.getElementById('plans-data').textContent);
     const previewFeatures = JSON.parse(document.getElementById('preview-features').textContent);
 
-    // Globals.
     const LOGO_URL        = window.PRITECH_LOGO_URL;
     const URLS            = window.URLS;
     const IS_AUTHENTICATED = window.IS_AUTHENTICATED;
     const SITE            = window.SITE || {};
 
-    // Motion variants.
     const fadeUp = hasMotion ? { hidden: { opacity: 0, y: 20 }, visible: { opacity: 1, y: 0, transition: { duration: 0.5 } } } : {};
     const staggerContainer = hasMotion ? { hidden: { opacity: 0 }, visible: { opacity: 1, transition: { staggerChildren: 0.1 } } } : {};
 
-    // ---------------------------------------------------------------
-    // Small reusable Modal component.
-    // ---------------------------------------------------------------
     const Modal = ({ isOpen, onClose, title, children }) => {
         if (!isOpen) return null;
         return (
@@ -90,16 +80,12 @@
         );
     };
 
-    // ---------------------------------------------------------------
-    // Main page.
-    // ---------------------------------------------------------------
     function App() {
         const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
         const [isContactOpen, setIsContactOpen] = useState(false);
 
         return (
             <div className="overflow-hidden min-h-screen flex flex-col relative">
-                {/* ---------------- Header ---------------- */}
                 <header className="bg-white border-b border-border px-4 py-3 sticky top-0 z-50">
                     <div className="max-w-[1200px] mx-auto flex items-center justify-between gap-6 relative">
                         <a href="/"><img src={LOGO_URL} alt={SITE.name} className="h-[34px] md:h-[44px] object-contain" /></a>
@@ -151,7 +137,6 @@
                     </div>
                 </header>
 
-                {/* ---------------- Hero ---------------- */}
                 <section className="px-4 md:px-6 py-8 md:py-[72px] max-w-[1200px] mx-auto w-full flex flex-col md:flex-row gap-8 md:gap-[48px] items-center">
                     <motion.div className="flex-1 flex flex-col gap-4 md:gap-5 w-full" initial="hidden" animate="visible" variants={staggerContainer}>
                         <motion.span variants={fadeUp} className="bg-brand-light text-brand text-xs md:text-sm font-semibold px-3 py-1.5 rounded-full self-start">{SITE.heroBadge}</motion.span>
@@ -174,7 +159,6 @@
                     </motion.div>
                 </section>
 
-                {/* ---------------- Plans ---------------- */}
                 <section id="plans" className="py-8 md:py-10 flex flex-col gap-6 md:gap-7 max-w-[1200px] mx-auto w-full">
                     <div className="px-4 md:px-6">
                         <h2 className="text-2xl md:text-[34px] font-heading font-bold text-navy">Choose your package</h2>
@@ -201,19 +185,29 @@
 
                 {/* ---------------- Footer ---------------- */}
                 <footer className="bg-navy text-navy-text px-4 py-6 mt-auto">
-                    <div className="max-w-[1200px] mx-auto flex flex-col md:flex-row gap-2 items-center">
-                        <span className="text-white font-heading font-bold text-lg">{SITE.name}</span>
-                        {SITE.footerTagline && (
-                            <span className="text-xs text-navy-text md:ml-4">{SITE.footerTagline}</span>
-                        )}
-                        <div className="md:ml-auto flex gap-4 text-sm">
-                            <a href={`mailto:${SITE.email}`} className="hover:text-white">{SITE.email}</a>
-                            <a href={`tel:${SITE.phone}`} className="hover:text-white">{SITE.phone}</a>
+                    <div className="max-w-[1200px] mx-auto flex flex-col gap-3">
+                        {/* Contact row */}
+                        <div className="flex flex-col md:flex-row gap-2 items-center">
+                            <span className="text-white font-heading font-bold text-lg">{SITE.name}</span>
+                            {SITE.footerTagline && (
+                                <span className="text-xs text-navy-text md:ml-4">{SITE.footerTagline}</span>
+                            )}
+                            <div className="md:ml-auto flex gap-4 text-sm">
+                                <a href={`mailto:${SITE.email}`} className="hover:text-white">{SITE.email}</a>
+                                <a href={`tel:${SITE.phone}`} className="hover:text-white">{SITE.phone}</a>
+                            </div>
+                        </div>
+
+                        {/* Legal row */}
+                        <div className="flex flex-wrap gap-4 text-xs pt-3 border-t border-navy-light">
+                            <a href="/legal/terms/"   className="hover:text-white">Terms of Service</a>
+                            <a href="/legal/privacy/" className="hover:text-white">Privacy Policy</a>
+                            <a href="/legal/aup/"     className="hover:text-white">Acceptable Use</a>
+                            <a href="/legal/refund/"  className="hover:text-white">Refund Policy</a>
                         </div>
                     </div>
                 </footer>
 
-                {/* ---------------- Contact modal ---------------- */}
                 <Modal isOpen={isContactOpen} onClose={() => setIsContactOpen(false)} title={`Contact ${SITE.name}`}>
                     <p className="text-sm text-muted mb-4">Send us an email or give us a call — we'll get back to you shortly.</p>
                     <a href={`mailto:${SITE.email}`} className="block text-center bg-brand text-white font-semibold py-3 rounded-xl mb-2 hover:bg-brand-hover">
