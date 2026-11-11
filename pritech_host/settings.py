@@ -1,14 +1,39 @@
 """
-Django settings for Pritech Host.
+Django settings for the Pritech Host project.
 
 Django  : 5.2.17
 Python  : 3.10+
-Docs    : https://docs.djangoproject.com/en/5.2/topics/settings/
 
-Environment-aware configuration:
-  - All sensitive values (DB, SECRET_KEY, API keys) come from `.env`.
-  - File lives at project root; DO NOT COMMIT `.env` to source control.
-  - Safe defaults let this file run locally even without a `.env`.
+Environment-aware configuration
+-------------------------------
+All sensitive values come from `.env` (see deploy_hosting.sh).
+Do NOT commit `.env` to source control.
+
+Development vs. Production
+--------------------------
+The SAME file serves both. The deltas are driven by env vars, not
+by separate files, so there's no risk of "I ran the wrong settings".
+
+    Variable                  | Dev default  | Prod default
+    ------------------------- | ------------ | ------------
+    DEBUG                     | True         | False
+    AXES_ENABLED              | False        | True
+    MFA_ENFORCE_FOR_STAFF     | False        | True (after enrollment)
+    RATELIMIT_ENABLE          | False        | True
+    REDIS_CACHE_URL           | ''           | redis://...
+    CELERY_BROKER_URL         | ''           | redis://...
+    SECURE_SSL_REDIRECT       | False        | True (after HTTPS)
+    SESSION_COOKIE_SECURE     | False        | True (after HTTPS)
+    CSRF_COOKIE_SECURE        | False        | True (after HTTPS)
+    SECURE_HSTS_SECONDS       | 0            | 31536000 (after 30d stable)
+
+A fresh clone runs `runserver` on http://127.0.0.1:8000 with:
+  - SQLite (no PostgreSQL needed)
+  - LocMemCache (no Redis needed)
+  - Celery in EAGER mode (no worker needed; tasks run inline)
+
+The moment `.env` supplies a real Redis URL, cache and Celery switch
+to async — same code path as prod.
 
 Organisation
 ------------
@@ -18,25 +43,28 @@ Organisation
  4. Templates
  5. Database
  6. Authentication
- 7. Django-allauth (login, signup, Google SSO, password reset)
- 8. Internationalisation
- 9. Static & media
-10. Email (cPanel SMTP)
-11. Third-party: PayChangu
-12. Third-party: HestiaCP
-13. Security headers
-14. Logging
-15. Cache (Redis-backed, shared across Gunicorn workers)
-16. Django Unfold (admin UI)
-17. Celery (background workers — email, provisioning, dunning)
-18. Celery Beat (scheduled tasks — daily renewal/dunning scan)
-19. Misc
+ 7. Django-allauth (login, signup, Google SSO, MFA)
+ 8. Brute-force protection (django-axes)
+ 9. Rate limiting (django-ratelimit)
+10. Internationalisation
+11. Static & media
+12. Email (cPanel SMTP)
+13. Third-party: PayChangu
+14. Third-party: HestiaCP
+15. Security headers
+16. Logging
+17. Cache (Redis in prod / LocMemCache in dev)
+18. Django Unfold (admin UI)
+19. Celery (background workers, with EAGER fallback for dev)
+20. Celery Beat (scheduled tasks — daily renewal/dunning scan)
+21. Misc
 
-Deploy target:
-  Domain       : pritechhost.com
-  WWW domain   : www.pritechhost.com
-  Server IP    : 204.168.251.91
-  WSGI app     : pritech_host.wsgi:application
+Deploy target
+-------------
+Domain       : pritechhost.com
+WWW domain   : www.pritechhost.com
+Server IP    : 204.168.251.91
+WSGI app     : pritech_host.wsgi:application
 """
 
 import os
@@ -52,34 +80,36 @@ from celery.schedules import crontab
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 # django-environ defaults.
-# Every bool() / list() needs a default so a missing .env key can't silently
-# flip a security setting to the wrong value.
+# Every bool() / list() needs a default so a missing .env key can't
+# silently flip a setting to the wrong value.
 env = environ.Env(
     # --- Core ---
     DEBUG=(bool, False),
 
-    # --- Security toggles (all OFF by default; enable via .env once HTTPS
-    #     is confirmed working on the live server) ---
+    # --- Feature flags ---
+    HESTIA_MOCK=(bool, True),
+    DUNNING_ENABLED=(bool, True),
+
+    # --- Email protocol ---
+    EMAIL_USE_SSL=(bool, True),
+    EMAIL_USE_TLS=(bool, False),
+
+    # --- Security toggles -----------------------------------------------
+    # All default to their DEV-safe values. deploy_hosting.sh (or you,
+    # manually) flips them for prod via .env once HTTPS is confirmed.
     SECURE_SSL_REDIRECT=(bool, False),
     SESSION_COOKIE_SECURE=(bool, False),
     CSRF_COOKIE_SECURE=(bool, False),
     SECURE_HSTS_INCLUDE_SUBDOMAINS=(bool, False),
     SECURE_HSTS_PRELOAD=(bool, False),
 
-    # --- Feature flags ---
-    HESTIA_MOCK=(bool, True),
-
-    # --- Email ---
-    EMAIL_USE_SSL=(bool, True),
-    EMAIL_USE_TLS=(bool, False),
-
-    # --- Celery / dunning ---
-    # Toggle the daily dunning scheduler on/off without redeploying code.
-    # Useful during maintenance windows or while triaging false-positives.
-    DUNNING_ENABLED=(bool, True),
+    # --- Security layers (SRS NFR-9 to NFR-13) -------------------------
+    AXES_ENABLED=(bool, False),
+    MFA_ENFORCE_FOR_STAFF=(bool, False),
+    RATELIMIT_ENABLE=(bool, False),
 )
 
-# Load `.env` if it exists. Safe to skip in CI or fresh clones.
+# Load .env if it exists — safe to skip in CI or fresh clones.
 ENV_FILE = os.path.join(BASE_DIR, '.env')
 if os.path.exists(ENV_FILE):
     environ.Env.read_env(ENV_FILE)
@@ -88,41 +118,23 @@ if os.path.exists(ENV_FILE):
 # ==============================================================================
 # 2. CORE SETTINGS & CONSTANTS
 # ==============================================================================
-# For production, set SECRET_KEY in .env. The default below lets `runserver`
-# work on a fresh clone but should NEVER survive to production.
 SECRET_KEY = env('SECRET_KEY', default='django-insecure-change-me-in-production')
-
 DEBUG = env('DEBUG')
 
-# Canonical domain + server IP. Reused below for ALLOWED_HOSTS, CSRF and
-# the PayChangu callback URLs so there's a single source of truth.
 PRIMARY_DOMAIN = env('PRIMARY_DOMAIN', default='pritechhost.com')
 WWW_DOMAIN     = f'www.{PRIMARY_DOMAIN}'
 SERVER_IP      = env('SERVER_IP', default='204.168.251.91')
 
-# Hosts Django will answer for.
-# The `.trycloudflare.com` wildcard allows a Cloudflare quick-tunnel to point
-# at this same server without editing settings — handy for staging.
 ALLOWED_HOSTS = env.list('ALLOWED_HOSTS', default=[
-    PRIMARY_DOMAIN,
-    WWW_DOMAIN,
-    SERVER_IP,
-    '127.0.0.1',
-    'localhost',
+    PRIMARY_DOMAIN, WWW_DOMAIN, SERVER_IP, '127.0.0.1', 'localhost',
     '.trycloudflare.com',
 ])
 
-# Origins permitted to make state-changing requests (POST/PUT/DELETE).
-# Both http:// and https:// are included so the site works in the window
-# between deploy and Certbot issuing a certificate.
 CSRF_TRUSTED_ORIGINS = env.list('CSRF_TRUSTED_ORIGINS', default=[
-    f'https://{PRIMARY_DOMAIN}',
-    f'https://{WWW_DOMAIN}',
-    f'http://{PRIMARY_DOMAIN}',
-    f'http://{WWW_DOMAIN}',
+    f'https://{PRIMARY_DOMAIN}', f'https://{WWW_DOMAIN}',
+    f'http://{PRIMARY_DOMAIN}',  f'http://{WWW_DOMAIN}',
     f'http://{SERVER_IP}',
-    'http://127.0.0.1:8000',
-    'http://localhost:8000',
+    'http://127.0.0.1:8000', 'http://localhost:8000',
     'https://*.trycloudflare.com',
 ])
 
@@ -144,13 +156,17 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
-    'django.contrib.sites',        # required by django-allauth
+    'django.contrib.sites',
 
     # ── Authentication ──
     'allauth',
     'allauth.account',
     'allauth.socialaccount',
     'allauth.socialaccount.providers.google',
+    'allauth.mfa',                 # TOTP 2FA (SRS NFR-9)
+
+    # ── Security ──
+    'axes',                        # brute-force lockout (SRS NFR-10)
 
     # ── Local apps ──
     'core',
@@ -160,7 +176,6 @@ INSTALLED_APPS = [
     'projects',
 ]
 
-# SRS FR-4: custom user model
 AUTH_USER_MODEL = 'users.User'
 
 MIDDLEWARE = [
@@ -171,8 +186,16 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
-    # Allauth must sit AFTER AuthenticationMiddleware
     'allauth.account.middleware.AccountMiddleware',
+
+    # ── Security middleware ─────────────────────────────────────────────
+    # Axes tracks failed logins AFTER the user is identified. Order it
+    # after AccountMiddleware so allauth's session state is settled.
+    'axes.middleware.AxesMiddleware',
+
+    # MFA enforcement — redirects un-enrolled staff to /accounts/2fa/.
+    # No-op when MFA_ENFORCE_FOR_STAFF=False (dev default).
+    'core.middleware.StaffMFAEnforcementMiddleware',
 ]
 
 ROOT_URLCONF = 'pritech_host.urls'
@@ -193,8 +216,6 @@ TEMPLATES = [
                 'django.template.context_processors.request',
                 'django.contrib.auth.context_processors.auth',
                 'django.contrib.messages.context_processors.messages',
-                # Injects SiteSettings.load() as `site` in every template.
-                # Required — removing this breaks every page using {{ site.* }}.
                 'core.context_processors.site_settings',
                 'core.context_processors.legal_documents',
             ],
@@ -206,9 +227,8 @@ TEMPLATES = [
 # ==============================================================================
 # 5. DATABASE
 # ==============================================================================
-# Production uses PostgreSQL (deploy_hosting.sh supplies DB_* env vars).
-# Local dev falls back to SQLite when DB_NAME is missing so contributors can
-# run `manage.py runserver` without installing PostgreSQL.
+# Prod uses PostgreSQL (deploy_hosting.sh supplies DB_* env vars).
+# Dev falls back to SQLite when DB_NAME is missing.
 if env('DB_NAME', default=''):
     DATABASES = {
         'default': {
@@ -218,11 +238,8 @@ if env('DB_NAME', default=''):
             'PASSWORD': env('DB_PASSWORD', default=''),
             'HOST':     env('DB_HOST',     default='127.0.0.1'),
             'PORT':     env('DB_PORT',     default='5432'),
-            'CONN_MAX_AGE': 600,   # reuse connections for 10 minutes
-            'OPTIONS': {
-                # Fail fast when Postgres is down instead of hanging forever.
-                'connect_timeout': 10,
-            },
+            'CONN_MAX_AGE': 600,
+            'OPTIONS': {'connect_timeout': 10},
         }
     }
 else:
@@ -238,9 +255,15 @@ else:
 # 6. AUTHENTICATION
 # ==============================================================================
 AUTHENTICATION_BACKENDS = [
-    # Django's default: handles superuser login in /admin/
+    # Axes backend FIRST so it can intercept failed logins and count
+    # them toward the lockout threshold BEFORE ModelBackend rejects.
+    # It's harmless when AXES_ENABLED=False (it just delegates).
+    'axes.backends.AxesStandaloneBackend',
+
+    # Django's default: handles admin login + superuser checks.
     'django.contrib.auth.backends.ModelBackend',
-    # Allauth backend: handles email + Google login on the public site
+
+    # Allauth backend: email + Google login on the public site.
     'allauth.account.auth_backends.AuthenticationBackend',
 ]
 
@@ -253,50 +276,94 @@ AUTH_PASSWORD_VALIDATORS = [
 
 
 # ==============================================================================
-# 7. DJANGO-ALLAUTH (login, signup, Google SSO, password reset)
+# 7. DJANGO-ALLAUTH (login, signup, Google SSO, MFA)
 # ==============================================================================
-# SITE_ID selects the Site row allauth uses to build OAuth callbacks.
-# The Site row's `domain` field MUST equal PRIMARY_DOMAIN, otherwise Google
-# rejects every login with `redirect_uri_mismatch`.
 SITE_ID = int(env('SITE_ID', default='1'))
 
-# Auth by email, not username
 ACCOUNT_USER_MODEL_USERNAME_FIELD = None
 ACCOUNT_LOGIN_METHODS = {'email'}
 ACCOUNT_SIGNUP_FIELDS = ['email*', 'password1*', 'password2*']
 ACCOUNT_UNIQUE_EMAIL = True
 
-# 'optional' lets people log in before verifying. Set to 'mandatory' in .env
-# once you want to force email verification before login.
 ACCOUNT_EMAIL_VERIFICATION = env('ACCOUNT_EMAIL_VERIFICATION', default='optional')
 
-# Redirect targets
-LOGIN_REDIRECT_URL           = '/dashboard/'
-ACCOUNT_LOGOUT_REDIRECT_URL  = '/'
-ACCOUNT_SIGNUP_REDIRECT_URL  = '/dashboard/'
+LOGIN_REDIRECT_URL          = '/dashboard/'
+ACCOUNT_LOGOUT_REDIRECT_URL = '/'
+ACCOUNT_SIGNUP_REDIRECT_URL = '/dashboard/'
+ACCOUNT_LOGOUT_ON_GET       = True
 
-# Allow GET-based logout links (home page / nav bar).
-ACCOUNT_LOGOUT_ON_GET = True
-
-# Google provider
+# ── Google OAuth ──────────────────────────────────────────────────────────
+# The APP dict is how allauth gets OAuth credentials. Without it,
+# allauth reads from the SocialApp admin row instead. Using the env
+# vars means you can rotate the client secret via .env without
+# touching the database.
 SOCIALACCOUNT_PROVIDERS = {
     'google': {
+        'APP': {
+            'client_id': env('GOOGLE_CLIENT_ID',     default=''),
+            'secret':    env('GOOGLE_CLIENT_SECRET', default=''),
+            'key':       '',
+        },
         'SCOPE': ['profile', 'email'],
         'AUTH_PARAMS': {'access_type': 'online'},
         'OAUTH_PKCE_ENABLED': True,
     }
 }
 
-# Auto-link a Google signup to an existing local user with the same email.
-# Lets customers who checked out as guests sign in with Google later without
-# creating a duplicate account.
 SOCIALACCOUNT_AUTO_SIGNUP = True
 SOCIALACCOUNT_EMAIL_AUTHENTICATION = True
 SOCIALACCOUNT_EMAIL_AUTHENTICATION_AUTO_CONNECT = True
 
+# --- MFA (SRS NFR-9) -----------------------------------------------------
+MFA_SUPPORTED_TYPES = ["totp", "recovery_codes"]
+MFA_ALLOW_UNVERIFIED_EMAIL = True
+# MFA_TOTP_ISSUER = "Pritech Host"   # shows in the authenticator app
+
 
 # ==============================================================================
-# 8. INTERNATIONALISATION
+# 8. BRUTE-FORCE PROTECTION — django-axes (SRS NFR-10)
+# ==============================================================================
+# Axes locks an account/IP pair after N failed login attempts.
+# In DEV it's off (AXES_ENABLED=False in .env) so test retries don't
+# lock you out. In PROD it's on — 5 failures → 1-hour lockout.
+# ------------------------------------------------------------------------------
+
+AXES_ENABLED             = env('AXES_ENABLED')
+AXES_FAILURE_LIMIT       = 5
+AXES_COOLOFF_TIME        = 1                # hours
+AXES_LOCK_OUT_AT_FAILURE = True
+AXES_RESET_ON_SUCCESS    = True
+
+# Lock by username AND IP independently. Blocks:
+#   - one account brute-forced from many IPs (username-based lock)
+#   - one IP brute-forcing many accounts (IP-based lock)
+AXES_LOCKOUT_PARAMETERS = ['username', 'ip_address']
+
+# Get the real client IP behind Nginx (X-Forwarded-For chain).
+AXES_IPWARE_PROXY_COUNT           = 1
+AXES_IPWARE_META_PRECEDENCE_ORDER = ['HTTP_X_FORWARDED_FOR', 'REMOTE_ADDR']
+
+# False = protect both /admin/login/ and /accounts/login/.
+# True  = protect only admin login. We want both protected → False.
+AXES_ONLY_ADMIN_SITE = False
+
+AXES_RESET_COOL_OFF_ON_VERIFIED_REQUEST = False
+
+
+# ==============================================================================
+# 9. RATE LIMITING — django-ratelimit (SRS NFR-11)
+# ==============================================================================
+# Applied per-view via @ratelimit decorators in core/views.py.
+# Dev default is OFF; prod default is ON.
+# ------------------------------------------------------------------------------
+
+RATELIMIT_ENABLE    = env('RATELIMIT_ENABLE')
+RATELIMIT_USE_CACHE = 'default'
+RATELIMIT_VIEW      = None
+
+
+# ==============================================================================
+# 10. INTERNATIONALISATION
 # ==============================================================================
 LANGUAGE_CODE = 'en-us'
 TIME_ZONE     = 'Africa/Blantyre'
@@ -305,10 +372,8 @@ USE_TZ        = True
 
 
 # ==============================================================================
-# 9. STATIC & MEDIA FILES
+# 11. STATIC & MEDIA FILES
 # ==============================================================================
-# Nginx serves STATIC_ROOT and MEDIA_ROOT directly, so this only affects the
-# `collectstatic` target path. Keep them in sync with nginx.conf.
 STATIC_URL       = '/static/'
 STATIC_ROOT      = BASE_DIR / 'staticfiles'
 STATICFILES_DIRS = [BASE_DIR / 'static']
@@ -316,27 +381,21 @@ STATICFILES_DIRS = [BASE_DIR / 'static']
 MEDIA_URL  = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
 
-# Uploads: cap request bodies at 25 MB (matches client_max_body_size in nginx).
 DATA_UPLOAD_MAX_MEMORY_SIZE = 25 * 1024 * 1024
 FILE_UPLOAD_MAX_MEMORY_SIZE = 25 * 1024 * 1024
 
 
 # ==============================================================================
-# 10. EMAIL (cPanel SMTP)
+# 12. EMAIL (cPanel SMTP)
 # ==============================================================================
-# cPanel mail servers typically use port 465 (SSL) or 587 (TLS).
-# Port 465 + SSL is what your .env ships with; if deliverability becomes
-# flaky, switch to 587 + EMAIL_USE_TLS=True in .env.
 EMAIL_BACKEND       = 'django.core.mail.backends.smtp.EmailBackend'
 EMAIL_HOST          = env('EMAIL_HOST',     default='mail.pritechmw.com')
 EMAIL_PORT          = env.int('EMAIL_PORT', default=465)
 EMAIL_HOST_USER     = env('EMAIL_HOST_USER', default='noreply@pritechmw.com')
 EMAIL_HOST_PASSWORD = env('EMAIL_HOST_PASSWORD', default='')
 EMAIL_USE_SSL       = env('EMAIL_USE_SSL')
-EMAIL_USE_TLS       = env('EMAIL_USE_TLS')       # mutually exclusive with SSL
+EMAIL_USE_TLS       = env('EMAIL_USE_TLS')
 
-# Every transactional email goes out as this. Reply-To always goes to sales,
-# which forwards to whoever is on shift.
 DEFAULT_FROM_EMAIL = env(
     'DEFAULT_FROM_EMAIL',
     default=f'Pritech Host <{EMAIL_HOST_USER}>',
@@ -344,13 +403,11 @@ DEFAULT_FROM_EMAIL = env(
 SALES_EMAIL  = env('SALES_EMAIL',  default='sales@pritechmw.com')
 SERVER_EMAIL = DEFAULT_FROM_EMAIL
 
-# Abort SMTP after 20s so a dead mail server can't hang a Celery worker.
-# (The webhook never blocks on SMTP — email sending is a Celery task.)
 EMAIL_TIMEOUT = env.int('EMAIL_TIMEOUT', default=20)
 
 
 # ==============================================================================
-# 11. THIRD-PARTY: PAYCHANGU
+# 13. THIRD-PARTY: PAYCHANGU
 # ==============================================================================
 PAYCHANGU_SECRET_KEY     = env('PAYCHANGU_SECRET_KEY',     default='')
 PAYCHANGU_WEBHOOK_SECRET = env('PAYCHANGU_WEBHOOK_SECRET', default='')
@@ -364,59 +421,57 @@ PAYCHANGU_RETURN_URL = env(
     'PAYCHANGU_RETURN_URL',
     default=f'https://{PRIMARY_DOMAIN}/payments/return/',
 )
-
-# Timeout for outbound PayChangu API calls (seconds).
 PAYCHANGU_TIMEOUT = env.int('PAYCHANGU_TIMEOUT', default=15)
 
 
 # ==============================================================================
-# 12. THIRD-PARTY: HESTIACP
+# 14. THIRD-PARTY: HESTIACP
 # ==============================================================================
-# When HESTIA_MOCK=True, the provisioning service logs what it *would* do
-# instead of calling the real Hestia API. Perfect for dev and CI.
 HESTIA_MOCK    = env('HESTIA_MOCK')
 HESTIA_HOST    = env('HESTIA_HOST',    default='https://your-hestia-server.com:8083')
 HESTIA_API_KEY = env('HESTIA_API_KEY', default='')
 
 
 # ==============================================================================
-# 13. SECURITY HEADERS
+# 15. SECURITY HEADERS (SRS NFR-12, NFR-13)
 # ==============================================================================
-# Behind Nginx, `X-Forwarded-Proto: https` is set for HTTPS requests. Django
-# uses this to know the original request was secure, so `request.is_secure()`
-# works and SECURE_SSL_REDIRECT doesn't cause a redirect loop.
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
-# Sane defaults — always on, regardless of environment.
+# SAMEORIGIN (not DENY) because Google Sign-In uses an iframe for
+# OAuth postMessage callbacks. DENY breaks Google SSO entirely.
 SECURE_CONTENT_TYPE_NOSNIFF = True
 SECURE_REFERRER_POLICY      = 'same-origin'
-X_FRAME_OPTIONS             = 'SAMEORIGIN'   # needed by some allauth popup flows
+X_FRAME_OPTIONS             = 'SAMEORIGIN'
 
-# Cookie hardening — safe to enable always (never readable from JS).
 SESSION_COOKIE_HTTPONLY = True
 CSRF_COOKIE_HTTPONLY    = True
 SESSION_COOKIE_SAMESITE = 'Lax'
 CSRF_COOKIE_SAMESITE    = 'Lax'
 
-# Env-controlled so the site works during initial HTTP testing.
-# Set to True in .env once Certbot has issued a working certificate.
+# HTTPS-dependent flags — off in dev, auto-flipped by deploy_hosting.sh
+# step 13 once it verifies HTTPS responds with 200.
 SECURE_SSL_REDIRECT   = env('SECURE_SSL_REDIRECT')
 SESSION_COOKIE_SECURE = env('SESSION_COOKIE_SECURE')
 CSRF_COOKIE_SECURE    = env('CSRF_COOKIE_SECURE')
 
-# HSTS: off by default. Enable with SECURE_HSTS_SECONDS=31536000 in .env
-# *after* HTTPS is stable. Enabling prematurely locks browsers into HTTPS.
+# HSTS — enable ONLY after HTTPS has been stable for 30+ days.
+# Setting this non-zero tells browsers to ALWAYS use HTTPS for a year.
+# If you enable it prematurely and lose the cert, the site becomes
+# unreachable for every returning visitor — they can't even click
+# "proceed anyway". Roll out gradually:
+#   1 week HTTPS stable    → SECURE_HSTS_SECONDS=3600
+#   2 weeks HTTPS stable   → SECURE_HSTS_SECONDS=86400
+#   30 days HTTPS stable   → SECURE_HSTS_SECONDS=31536000
+# Then add INCLUDE_SUBDOMAINS=True. PRELOAD is a separate 6-month
+# commitment to browsers — only add after 30 days of HSTS=31536000.
 SECURE_HSTS_SECONDS            = env.int('SECURE_HSTS_SECONDS', default=0)
 SECURE_HSTS_INCLUDE_SUBDOMAINS = env('SECURE_HSTS_INCLUDE_SUBDOMAINS')
 SECURE_HSTS_PRELOAD            = env('SECURE_HSTS_PRELOAD')
 
 
 # ==============================================================================
-# 14. LOGGING
+# 16. LOGGING
 # ==============================================================================
-# systemd captures stdout/stderr — watch in real time with:
-#   journalctl -u gunicorn-pritechhost -f
-#   journalctl -u celery-pritechhost   -f
 LOGGING = {
     'version': 1,
     'disable_existing_loggers': False,
@@ -438,69 +493,60 @@ LOGGING = {
         'level': 'INFO',
     },
     'loggers': {
-        'django': {
-            'handlers': ['console'],
-            'level': 'INFO',
-            'propagate': False,
-        },
-        'django.security': {
-            'handlers': ['console'],
-            'level': 'WARNING',
-            'propagate': False,
-        },
-        # Application loggers — webhook, provisioning, billing, dunning
-        'core': {
-            'handlers': ['console'],
-            'level': 'INFO',
-            'propagate': False,
-        },
-        'hosting': {
-            'handlers': ['console'],
-            'level': 'INFO',
-            'propagate': False,
-        },
-        'billing': {
-            'handlers': ['console'],
-            'level': 'INFO',
-            'propagate': False,
-        },
+        'django':          {'handlers': ['console'], 'level': 'INFO',    'propagate': False},
+        'django.security': {'handlers': ['console'], 'level': 'WARNING', 'propagate': False},
+        'axes':            {'handlers': ['console'], 'level': 'WARNING', 'propagate': False},
+        'allauth':         {'handlers': ['console'], 'level': 'INFO',    'propagate': False},
+        'core':            {'handlers': ['console'], 'level': 'INFO',    'propagate': False},
+        'hosting':         {'handlers': ['console'], 'level': 'INFO',    'propagate': False},
+        'billing':         {'handlers': ['console'], 'level': 'INFO',    'propagate': False},
     },
 }
 
 
 # ==============================================================================
-# 15. CACHE (Redis-backed, shared across Gunicorn workers)
+# 17. CACHE
 # ==============================================================================
-# SiteSettings.load() reads/writes django.core.cache. With the default
-# per-process LocMemCache, each Gunicorn worker has its *own* cache — meaning
-# an admin edit invalidates only one worker and the other two serve stale
-# site content for up to 10 minutes.
+# The 400/500 "no Redis" problem, fixed
+# --------------------------------------
+# Previous versions defaulted REDIS_CACHE_URL to a real Redis URL. That
+# meant a fresh Windows dev clone crashed on every page with
+# "Error 10061: No connection could be made". Now the default is '',
+# so dev falls back to LocMemCache and works with zero setup.
 #
-# Pointing the cache at Redis (DB 1, keeping DB 0 for Celery) gives a single
-# shared cache across all workers, so admin edits are visible immediately.
-REDIS_CACHE_URL = env('REDIS_CACHE_URL', default='redis://127.0.0.1:6379/1')
+# Prod sets REDIS_CACHE_URL in .env (via deploy_hosting.sh). Redis DB 1
+# is used so a FLUSHDB on the cache never touches the Celery broker
+# queue (which lives in Redis DB 0).
+# ------------------------------------------------------------------------------
+
+REDIS_CACHE_URL = env('REDIS_CACHE_URL', default='')
 
 if REDIS_CACHE_URL:
+    # Production / when Redis is explicitly configured
     CACHES = {
         'default': {
-            'BACKEND': 'django.core.cache.backends.redis.RedisCache',
+            'BACKEND':  'django.core.cache.backends.redis.RedisCache',
             'LOCATION': REDIS_CACHE_URL,
-            'TIMEOUT': 600,          # default TTL = 10 minutes
-            'OPTIONS': {
-                'db': '1',           # explicit for clarity
-            },
+            'TIMEOUT':  600,
+            'OPTIONS':  {'db': '1'},
         }
     }
 else:
+    # Development default — per-process in-memory cache. Each Django
+    # process (there's one under runserver) has its own copy, so no
+    # cross-process sharing. That's fine: the only consumers are
+    # SiteSettings.load() and legal_documents(), both of which are
+    # fine with per-process caching.
     CACHES = {
         'default': {
-            'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+            'BACKEND':  'django.core.cache.backends.locmem.LocMemCache',
+            'LOCATION': 'pritechhost-dev',
         }
     }
 
 
 # ==============================================================================
-# 16. DJANGO UNFOLD (Admin UI)
+# 18. DJANGO UNFOLD (Admin UI)
 # ==============================================================================
 UNFOLD = {
     'SITE_TITLE':  'Pritech Host Admin',
@@ -538,57 +584,80 @@ UNFOLD = {
                     {'title': 'Profiles',  'icon': 'badge',  'link': '/admin/users/customerprofile/'},
                 ],
             },
+            {
+                'title': 'Security',
+                'items': [
+                    {'title': 'Login Attempts', 'icon': 'shield', 'link': '/admin/axes/accessattempt/'},
+                    {'title': 'Access Log',     'icon': 'receipt', 'link': '/admin/axes/accesslog/'},
+                ],
+            },
         ],
     },
 }
 
 
 # ==============================================================================
-# 17. CELERY (background workers — email, provisioning, dunning)
+# 19. CELERY (background workers — email, provisioning, dunning)
 # ==============================================================================
-# Celery offloads email delivery, Hestia provisioning and the daily
-# renewal/dunning scan from the request/response cycle. The PayChangu
-# webhook returns 200 in ~50 ms instead of waiting 10–60 s for SMTP +
-# Hestia API.
+# The "no worker" fallback, explained
+# ------------------------------------
+# Real Celery needs a broker (Redis) and a running worker process. That
+# is overkill for `python manage.py runserver` when you're just testing
+# the UI. So:
 #
-# Run at least one worker:
-#   celery -A pritech_host worker -l info -Q default,emails,provisioning
+#   • CELERY_BROKER_URL empty → EAGER mode:
+#       * `.delay(...)` runs the task synchronously in the caller thread
+#       * emails are sent during the HTTP request (slow, but you see errors)
+#       * payment webhooks send confirmation emails before returning 200
+#       * no worker process needed, no Redis needed
+#
+#   • CELERY_BROKER_URL set (prod) → normal async:
+#       * `.delay(...)` enqueues to Redis
+#       * worker process picks up tasks
+#       * webhook returns in ~50 ms while emails send in the background
+#
+# The end result is the SAME API (`task.delay(...)`), different runtime.
 # ------------------------------------------------------------------------------
 
-CELERY_BROKER_URL     = env('CELERY_BROKER_URL',     default='redis://127.0.0.1:6379/0')
-CELERY_RESULT_BACKEND = env('CELERY_RESULT_BACKEND', default='redis://127.0.0.1:6379/0')
+CELERY_BROKER_URL = env('CELERY_BROKER_URL', default='')
 
-# --- Serialisation ----------------------------------------------------------
-# JSON only — never allow pickle in production (security + worker compat).
+if not CELERY_BROKER_URL:
+    # ── DEVELOPMENT: run tasks inline ──
+    # `memory://` is a valid broker that doesn't require external services,
+    # but we also set ALWAYS_EAGER so tasks don't wait for a worker.
+    CELERY_BROKER_URL          = 'memory://'
+    CELERY_RESULT_BACKEND      = 'cache+memory://'
+    CELERY_TASK_ALWAYS_EAGER   = True
+    # Propagate task exceptions to the caller so failures surface in the
+    # web request traceback (much easier to debug than a swallowed log).
+    CELERY_TASK_EAGER_PROPAGATES = True
+    CELERY_TASK_STORE_EAGER_RESULT = False   # don't bloat memory with results
+else:
+    # ── PRODUCTION: real async broker ──
+    CELERY_RESULT_BACKEND         = env(
+        'CELERY_RESULT_BACKEND',
+        default=CELERY_BROKER_URL,
+    )
+    CELERY_TASK_ALWAYS_EAGER      = False
+    CELERY_TASK_EAGER_PROPAGATES  = False
+
+# Serialisation — JSON only, never pickle
 CELERY_ACCEPT_CONTENT    = ['json']
 CELERY_TASK_SERIALIZER   = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
 CELERY_TIMEZONE          = TIME_ZONE
 
-# --- Reliability ------------------------------------------------------------
-# Re-deliver the task to another worker if the current one dies mid-task.
-CELERY_TASK_ACKS_LATE = True
-
-# Fetch only one task per worker child. With ACKS_LATE this gives us true
-# at-least-once delivery — a crashed worker won't silently swallow tasks.
-CELERY_WORKER_PREFETCH_MULTIPLIER = 1
-
-# If Redis isn't up yet when the worker boots (e.g. systemd boot order races),
-# keep retrying instead of crashing out.
+# Reliability
+CELERY_TASK_ACKS_LATE                     = True
+CELERY_WORKER_PREFETCH_MULTIPLIER         = 1
 CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
 
-# --- Safety rails -----------------------------------------------------------
-# Soft limit raises SoftTimeLimitExceeded (task can clean up), hard limit kills.
-# 240 s soft / 300 s hard is generous for a single email or a Hestia API call,
-# but the dunning scan iterates subscriptions — a slow loop is caught here
-# before it can hold a worker slot for hours.
+# Safety rails
 CELERY_TASK_SOFT_TIME_LIMIT = 240
 CELERY_TASK_TIME_LIMIT      = 300
 CELERY_TASK_TRACK_STARTED   = True
 
-# --- Routing ----------------------------------------------------------------
-# Task names MUST match the fully-qualified path of the @shared_task in the
-# codebase. Renaming a task module means updating this dict too.
+# Routing — task name must match the fully-qualified path of @shared_task
 CELERY_TASK_ROUTES = {
     'core.tasks.send_transactional_email_task':     {'queue': 'emails'},
     'hosting.tasks.provision_hosting_account_task': {'queue': 'provisioning'},
@@ -598,43 +667,19 @@ CELERY_TASK_DEFAULT_QUEUE = 'default'
 
 
 # ==============================================================================
-# 18. CELERY BEAT (periodic tasks — daily renewal/dunning scan)
+# 20. CELERY BEAT (periodic tasks — daily renewal/dunning scan)
 # ==============================================================================
-# Runs `check_subscription_lifecycle` once per day at 00:30 Africa/Blantyre.
-# That task drives the full renewal + dunning timeline:
-#
-#   -30d  early reminder email
-#   -14d  generate renewal invoice + reminder with pay link
-#    -7d  reminder
-#    -3d  urgent reminder
-#    -1d  final reminder
-#     0d  expiry notice
-#    +7d  suspension warning (24h notice)
-#    +8d  SUSPEND Hestia account
-#   +30d  final warning (deletion in 15 days)
-#   +45d  delete Hestia account, cancel subscription
-#
-# Toggle the whole schedule off via DUNNING_ENABLED=False in .env — useful
-# during a maintenance window, or while triaging a customer complaint where
-# you don't want more reminder emails going out.
-# ------------------------------------------------------------------------------
-
 CELERY_BEAT_SCHEDULE = {}
 
 if env('DUNNING_ENABLED'):
     CELERY_BEAT_SCHEDULE['check-subscription-lifecycle'] = {
         'task': 'billing.tasks.check_subscription_lifecycle',
-        # 00:30 Africa/Blantyre = 22:30 UTC (CAT is UTC+2).
-        # Runs at 00:30 local, so any 24h clock day-boundary weirdness
-        # is already settled by the time staff check the dashboard at 08:00.
-        'schedule': crontab(hour=0, minute=30),
+        'schedule': crontab(hour=0, minute=30),   # 00:30 Africa/Blantyre
     }
 
 
 # ==============================================================================
-# 19. MISC
+# 21. MISC
 # ==============================================================================
-DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
-
-# Used by Django's built-in password reset flow (allauth handles ours).
+DEFAULT_AUTO_FIELD     = 'django.db.models.BigAutoField'
 PASSWORD_RESET_TIMEOUT = 86400   # 24 hours

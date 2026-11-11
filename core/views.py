@@ -7,17 +7,23 @@ Sections
 2. Customer dashboard  — dashboard shell, profile shell, JSON APIs
 3. Payment gateway     — PayChangu webhook + browser callbacks
 4. Legal documents     — versioned legal pages + cookie consent API
+5. Ticket conversation — customer-facing threaded ticket APIs (SRS FR-46)
 
-Conventions
------------
-* Read-only site content lives on ``SiteSettings`` (exposed as ``site``).
-* Email and Hestia provisioning run asynchronously via Celery.
-* Every path that settles a payment funnels through
-  ``_handle_renewal_payment()`` so a renewal invoice paid through any
-  path extends the subscription and reactivates the Hestia account.
-* Legal acceptance is recorded:
-    - at signup     → via core.signals.record_signup_acceptance
-    - at checkout   → inside ``CheckoutView.form_valid`` (below)
+Rate limiting (SRS NFR-11)
+--------------------------
+Sensitive state-changing endpoints are wrapped with @ratelimit so a
+compromised or malicious session can't:
+  - spam payment initiations (would create orphan Payment rows)
+  - create thousands of tickets
+  - flood the customer's own ticket thread
+  - hammer the cookie-consent audit log
+
+Limits are per-user (or per-IP for anonymous endpoints) and only apply
+when RATELIMIT_ENABLE=True (prod). Dev defaults to off.
+
+Login endpoints are NOT rate-limited here — django-axes handles
+brute-force protection on those with a separate mechanism (lockout
+after 5 failures vs. throttled throughput here).
 """
 import hashlib
 import hmac
@@ -38,6 +44,9 @@ from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_exempt
 from django.views.generic import FormView, ListView, TemplateView, View
 
+# Rate limiting (SRS NFR-11)
+from django_ratelimit.decorators import ratelimit
+
 from billing.models import Invoice, Payment, Plan, Subscription
 from billing.services.invoice_pdf import generate_invoice_pdf
 from billing.services.paychangu import PayChanguService
@@ -55,6 +64,7 @@ from .forms import CheckoutForm, CustomerProfileForm, UserProfileForm
 from .models import (
     SiteSettings,
     Ticket,
+    TicketReply,
     LegalDocument,
     TermsAcceptance,
     CookieConsent,
@@ -76,13 +86,7 @@ def _human_period(plan: Plan) -> str:
 
 
 def _get_client_ip(request) -> str | None:
-    """
-    Extract the real client IP behind Nginx.
-
-    Nginx sets ``X-Forwarded-For`` to ``client, proxy1, proxy2`` — the
-    leftmost entry is the origin. Used by TermsAcceptance, CookieConsent
-    and signal handlers.
-    """
+    """Extract the real client IP behind Nginx (leftmost X-Forwarded-For)."""
     if request is None:
         return None
     x_forwarded = request.META.get('HTTP_X_FORWARDED_FOR')
@@ -92,13 +96,7 @@ def _get_client_ip(request) -> str | None:
 
 
 def _handle_renewal_payment(invoice: Invoice) -> None:
-    """
-    Extend the linked subscription when a renewal invoice is paid.
-
-    Called from the webhook, the browser callback and the dashboard sync.
-    Idempotent: after this runs once, ``renewal_invoice`` is None, so
-    subsequent calls no-op.
-    """
+    """Extend the linked subscription when a renewal invoice is paid."""
     if invoice.invoice_type != 'renewal' or not invoice.subscription_id:
         return
 
@@ -155,13 +153,7 @@ class HomeView(ListView):
 
 
 class CheckoutView(FormView):
-    """
-    SRS FR-15, FR-63, FR-64 — Checkout flow.
-
-    Records Terms/Privacy/AUP acceptance inside ``form_valid`` — the
-    acceptance is logged at the moment the customer completes checkout,
-    even if the payment itself later fails.
-    """
+    """SRS FR-15, FR-63, FR-64 — Checkout flow."""
     template_name = 'core/checkout.html'
     form_class = CheckoutForm
 
@@ -189,7 +181,6 @@ class CheckoutView(FormView):
     def form_valid(self, form):
         cleaned = form.cleaned_data
 
-        # --- Step 1: resolve / create the customer ------------------------
         if self.request.user.is_authenticated:
             user = self.request.user
             user.phone_number  = user.phone_number  or cleaned.get('phone_number')
@@ -203,70 +194,56 @@ class CheckoutView(FormView):
                 profile.save()
         else:
             user = User.objects.create(
-                username      = cleaned['email'],
-                email         = cleaned['email'],
-                first_name    = cleaned['first_name'],
-                last_name     = cleaned.get('last_name', ''),
-                phone_number  = cleaned['phone_number'],
-                date_of_birth = cleaned['date_of_birth'],
-                gender        = cleaned['gender'],
+                username=cleaned['email'], email=cleaned['email'],
+                first_name=cleaned['first_name'],
+                last_name=cleaned.get('last_name', ''),
+                phone_number=cleaned['phone_number'],
+                date_of_birth=cleaned['date_of_birth'],
+                gender=cleaned['gender'],
             )
             user.set_unusable_password()
             user.save()
 
             CustomerProfile.objects.create(
-                user=user,
-                company_name=cleaned.get('company_name', ''),
+                user=user, company_name=cleaned.get('company_name', ''),
             )
             login(
                 self.request, user,
                 backend='django.contrib.auth.backends.ModelBackend',
             )
 
-        # --- Step 2: subscription, project, deposit invoice ---------------
         end_date = timezone.now().date() + timedelta(days=self.plan.period_days)
         subscription = Subscription.objects.create(
             user=user, plan=self.plan, end_date=end_date,
         )
 
         Project.objects.create(
-            customer=user,
-            subscription=subscription,
+            customer=user, subscription=subscription,
             requested_domain=cleaned.get('requested_domain', ''),
-            total_price_mwk=self.plan.price_mwk,
-            stage='deposit',
+            total_price_mwk=self.plan.price_mwk, stage='deposit',
         )
 
         deposit_amount = self.plan.price_mwk * Decimal('0.25')
         invoice = Invoice.objects.create(
-            customer=user,
-            due_date=timezone.now().date(),
-            subtotal_mwk=deposit_amount,
-            total_mwk=deposit_amount,
-            is_deposit=True,
-            invoice_type='deposit',
+            customer=user, due_date=timezone.now().date(),
+            subtotal_mwk=deposit_amount, total_mwk=deposit_amount,
+            is_deposit=True, invoice_type='deposit',
             subscription=subscription,
         )
 
-        # --- NEW: record Terms / Privacy / AUP acceptance -----------------
-        # The CheckoutForm has `accept_terms=True` (required=True) so we
-        # only reach this point if the customer actually ticked the box.
-        client_ip = _get_client_ip(self.request)
+        # Record legal acceptance
+        client_ip  = _get_client_ip(self.request)
         user_agent = self.request.META.get('HTTP_USER_AGENT', '')[:1000]
 
         for slug in ('terms', 'privacy', 'aup'):
             doc = LegalDocument.current(slug)
             if doc:
                 TermsAcceptance.objects.create(
-                    user=user,
-                    document=doc,
-                    context='checkout',
-                    ip_address=client_ip,
-                    user_agent=user_agent,
+                    user=user, document=doc, context='checkout',
+                    ip_address=client_ip, user_agent=user_agent,
                     content_hash=doc.content_hash(),
                 )
 
-        # --- Step 3: redirect to gateway ----------------------------------
         checkout_url = PayChanguService.initiate_payment(invoice)
         if checkout_url:
             return redirect(checkout_url)
@@ -296,15 +273,11 @@ class DashboardView(LoginRequiredMixin, TemplateView):
 
 
 class DashboardAPIView(LoginRequiredMixin, View):
-    """
-    Single JSON feed powering the React dashboard.
-    Includes a ``renewal`` block consumed by the renewal warning banner.
-    """
+    """Single JSON feed powering the React dashboard."""
     def get(self, request, *args, **kwargs):
         user = request.user
         site = SiteSettings.load()
 
-        # Missed-webhook recovery
         sync_pending_payments(user)
         _post_sync_renewals(user)
 
@@ -344,8 +317,34 @@ class DashboardAPIView(LoginRequiredMixin, View):
             .first()
         )
 
-        tickets            = Ticket.objects.filter(user=user).order_by('-created_at')[:5]
-        open_tickets_count = Ticket.objects.filter(user=user, status='open').count()
+        tickets = (
+            Ticket.objects
+            .filter(user=user)
+            .prefetch_related('replies')
+            .order_by('-updated_at')[:10]
+        )
+
+        open_tickets_count = Ticket.objects.filter(
+            user=user, status__in=('open', 'awaiting_customer'),
+        ).count()
+
+        unread_replies_total = TicketReply.objects.filter(
+            ticket__user=user, is_staff_reply=True, read_by_customer=False,
+        ).count()
+
+        tickets_payload = [
+            {
+                'id':             t.id,
+                'subject':        t.subject,
+                'status':         t.status,
+                'status_display': t.get_status_display(),
+                'created_at':     t.created_at.strftime('%d %b %Y'),
+                'updated_at':     t.updated_at.strftime('%d %b %Y, %H:%M'),
+                'reply_count':    t.reply_count,
+                'unread_replies': t.unread_customer_replies,
+                'last_preview':   t.last_message_preview,
+            } for t in tickets
+        ]
 
         renewal_info = None
         if subscription:
@@ -413,17 +412,10 @@ class DashboardAPIView(LoginRequiredMixin, View):
                 'domain':        project.requested_domain,
                 'total_price':   float(project.total_price_mwk),
             } if project else None,
-            'tickets': [
-                {
-                    'id':             t.id,
-                    'subject':        t.subject,
-                    'status':         t.status,
-                    'status_display': t.get_status_display(),
-                    'created_at':     t.created_at.strftime('%d %b %Y'),
-                } for t in tickets
-            ],
-            'open_tickets_count': open_tickets_count,
-            'payment_processing': has_recent_pending_payment(user),
+            'tickets':              tickets_payload,
+            'open_tickets_count':   open_tickets_count,
+            'unread_replies_total': unread_replies_total,
+            'payment_processing':   has_recent_pending_payment(user),
         })
 
 
@@ -432,7 +424,15 @@ class ProfileView(LoginRequiredMixin, TemplateView):
     login_url = '/accounts/login/'
 
 
+@method_decorator(
+    # 30 profile updates per hour per user — covers batch-editing via
+    # the dashboard without blocking normal use.
+    ratelimit(key='user', rate='30/h', method='POST', block=True),
+    name='dispatch',
+)
 class ProfileAPIView(LoginRequiredMixin, View):
+    """Read + update personal and billing details."""
+
     def get(self, request, *args, **kwargs):
         user = request.user
         profile, _ = CustomerProfile.objects.get_or_create(user=user)
@@ -474,6 +474,13 @@ class ProfileAPIView(LoginRequiredMixin, View):
         return JsonResponse({'success': False, 'errors': errors}, status=400)
 
 
+@method_decorator(
+    # 10 payment initiations per hour per user. Legitimate customers pay
+    # 1–3 invoices per visit; 10/h is very generous and blocks anyone
+    # using the account as a card-testing or spam gateway.
+    ratelimit(key='user', rate='10/h', method='POST', block=True),
+    name='dispatch',
+)
 class PayInvoiceAPIView(LoginRequiredMixin, View):
     """Kick off PayChangu for an unpaid invoice (dashboard 'Pay now')."""
     def post(self, request, *args, **kwargs):
@@ -488,7 +495,15 @@ class PayInvoiceAPIView(LoginRequiredMixin, View):
         return JsonResponse({'error': 'Gateway error'}, status=500)
 
 
+@method_decorator(
+    # 5 new tickets per hour per user. A real customer opening 6 tickets
+    # in one hour is far more likely a bot or an angry spammer than a
+    # genuine need.
+    ratelimit(key='user', rate='5/h', method='POST', block=True),
+    name='dispatch',
+)
 class CreateTicketAPIView(LoginRequiredMixin, View):
+    """SRS FR-34: customer creates a new ticket from the dashboard modal."""
     def post(self, request, *args, **kwargs):
         data    = json.loads(request.body)
         subject = (data.get('subject') or '').strip()
@@ -497,7 +512,9 @@ class CreateTicketAPIView(LoginRequiredMixin, View):
         if not subject or not message:
             return JsonResponse({'error': 'Subject and message are required'}, status=400)
 
-        ticket = Ticket.objects.create(user=request.user, subject=subject, message=message)
+        ticket = Ticket.objects.create(
+            user=request.user, subject=subject, message=message,
+        )
         return JsonResponse({
             'success': True,
             'ticket': {
@@ -527,13 +544,7 @@ class InvoicePDFView(LoginRequiredMixin, View):
 
 @method_decorator(csrf_exempt, name='dispatch')
 class PayChanguWebhookView(View):
-    """
-    PayChangu → server notification.
-
-    Verifies the HMAC signature, settles the invoice via
-    ``finalize_invoice_payment``, then triggers the renewal extension
-    if the settled invoice was a renewal.
-    """
+    """PayChangu → server notification. Signature verified, then settle."""
     def post(self, request, *args, **kwargs):
         logger.info(
             "PayChangu Webhook Payload: %s",
@@ -607,14 +618,7 @@ class PaymentReturnView(View):
 # ==============================================================================
 
 class LegalDocumentView(TemplateView):
-    """
-    Render any active legal document by slug.
-
-    Valid slugs: ``terms``, ``privacy``, ``aup``, ``refund``. The
-    sidebar tab switcher is populated from ``LegalDocument.SLUG_CHOICES``
-    and only includes tabs for documents that actually exist (so a
-    missing AUP doesn't render a broken tab).
-    """
+    """Render any active legal document by slug."""
     template_name = 'core/legal/document.html'
 
     def get_context_data(self, **kwargs):
@@ -625,7 +629,6 @@ class LegalDocumentView(TemplateView):
         if not doc:
             raise Http404(f"Legal document '{slug}' not found.")
 
-        # Only include tabs whose documents exist.
         available_tabs = []
         for tab_slug, tab_label in LegalDocument.SLUG_CHOICES:
             if LegalDocument.current(tab_slug) is not None:
@@ -637,21 +640,17 @@ class LegalDocumentView(TemplateView):
         return context
 
 
-# ==============================================================================
-# 5. COOKIE CONSENT API
-# ==============================================================================
-
+@method_decorator(
+    # 5 cookie-consent submissions per minute per IP. The banner should
+    # fire once per session; a flood means someone is hammering the
+    # audit table (or a JS bug is re-firing). 5/min gives room for
+    # editing preferences without opening a DoS vector.
+    ratelimit(key='ip', rate='5/m', method='POST', block=True),
+    name='dispatch',
+)
 @method_decorator(csrf_exempt, name='dispatch')
 class CookieConsentAPIView(View):
-    """
-    Records cookie banner consent from the AJAX banner.
-
-    CSRF-exempt so the banner works for anonymous visitors who haven't
-    established a session yet. This endpoint only stores consent flags
-    keyed by session_key — it does not grant any privilege, so exemption
-    is low-risk. Idempotent: re-submitting for the same session updates
-    the existing row.
-    """
+    """Records cookie banner consent from the AJAX banner."""
     def post(self, request, *args, **kwargs):
         try:
             data = json.loads(request.body)
@@ -662,7 +661,6 @@ class CookieConsentAPIView(View):
         if not isinstance(categories, dict):
             return JsonResponse({'error': 'categories must be an object'}, status=400)
 
-        # Ensure a session exists so we have a stable key.
         if not request.session.session_key:
             request.session.create()
 
@@ -676,8 +674,99 @@ class CookieConsentAPIView(View):
             },
         )
 
-        # Also flag in session so the banner doesn't reappear (belt and
-        # braces — the banner primarily uses localStorage).
         request.session['cookie_consent_given'] = True
-
         return JsonResponse({'success': True})
+
+
+# ==============================================================================
+# 5. TICKET CONVERSATION APIs (SRS FR-46)
+# ==============================================================================
+
+class TicketDetailAPIView(LoginRequiredMixin, View):
+    """
+    Return a ticket with its full reply thread. Marks staff replies as
+    read by the customer.
+    """
+    def get(self, request, ticket_id, *args, **kwargs):
+        try:
+            ticket = Ticket.objects.get(id=ticket_id, user=request.user)
+        except Ticket.DoesNotExist:
+            return JsonResponse({'error': 'Ticket not found'}, status=404)
+
+        TicketReply.objects.filter(
+            ticket=ticket, is_staff_reply=True, read_by_customer=False,
+        ).update(read_by_customer=True)
+
+        replies = ticket.replies.select_related('author').all()
+
+        return JsonResponse({
+            'ticket': {
+                'id':             ticket.id,
+                'subject':        ticket.subject,
+                'message':        ticket.message,
+                'status':         ticket.status,
+                'status_display': ticket.get_status_display(),
+                'created_at':     ticket.created_at.strftime('%d %b %Y, %H:%M'),
+                'updated_at':     ticket.updated_at.strftime('%d %b %Y, %H:%M'),
+            },
+            'replies': [
+                {
+                    'id':             r.id,
+                    'message':        r.message,
+                    'is_staff_reply': r.is_staff_reply,
+                    'author_name': (
+                        'Pritech Support' if r.is_staff_reply
+                        else (
+                            (r.author.first_name or r.author.email)
+                            if r.author else 'Customer'
+                        )
+                    ),
+                    'created_at': r.created_at.strftime('%d %b %Y, %H:%M'),
+                }
+                for r in replies
+            ],
+        })
+
+
+@method_decorator(
+    # 30 replies per hour per user — high enough for a normal back-and-forth
+    # with support, low enough that a bot can't flood the thread.
+    ratelimit(key='user', rate='30/h', method='POST', block=True),
+    name='dispatch',
+)
+class ReplyToTicketAPIView(LoginRequiredMixin, View):
+    """Customer adds a reply to their own ticket."""
+    def post(self, request, ticket_id, *args, **kwargs):
+        try:
+            ticket = Ticket.objects.get(id=ticket_id, user=request.user)
+        except Ticket.DoesNotExist:
+            return JsonResponse({'error': 'Ticket not found'}, status=404)
+
+        if ticket.status == 'closed':
+            return JsonResponse(
+                {'error': 'This ticket is closed. Open a new ticket instead.'},
+                status=400,
+            )
+
+        data    = json.loads(request.body)
+        message = (data.get('message') or '').strip()
+        if not message:
+            return JsonResponse({'error': 'Message is required'}, status=400)
+
+        reply = TicketReply.objects.create(
+            ticket=ticket,
+            author=request.user,
+            is_staff_reply=False,
+            message=message,
+        )
+
+        return JsonResponse({
+            'success': True,
+            'reply': {
+                'id':             reply.id,
+                'message':        reply.message,
+                'is_staff_reply': reply.is_staff_reply,
+                'author_name':    request.user.first_name or request.user.email,
+                'created_at':     reply.created_at.strftime('%d %b %Y, %H:%M'),
+            },
+        })

@@ -24,6 +24,12 @@ urlpatterns = [
     path('invoices/<int:invoice_id>/pdf/', views.InvoicePDFView.as_view(), name='invoice_pdf'),
 
     # ==========================================
+    # Ticket Conversation APIs (SRS FR-46)
+    # ==========================================
+    path('api/tickets/<int:ticket_id>/', views.TicketDetailAPIView.as_view(), name='api_ticket_detail'),
+    path('api/tickets/<int:ticket_id>/reply/', views.ReplyToTicketAPIView.as_view(), name='api_ticket_reply'),
+
+    # ==========================================
     # Payment Gateway (PayChangu)
     # ==========================================
     path('payments/webhook/', views.PayChanguWebhookView.as_view(), name='paychangu_webhook'),
@@ -31,7 +37,7 @@ urlpatterns = [
     path('payments/return/', views.PaymentReturnView.as_view(), name='payment_return'),
 
     # ==========================================
-    # Legal Documents & Cookie Consent  (NEW)
+    # Legal Documents & Cookie Consent
     # ==========================================
     path('legal/<str:slug>/', views.LegalDocumentView.as_view(), name='legal_document'),
     path('api/cookie-consent/', views.CookieConsentAPIView.as_view(), name='api_cookie_consent'),

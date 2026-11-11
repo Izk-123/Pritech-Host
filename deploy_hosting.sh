@@ -12,28 +12,25 @@
 #   5.  PostgreSQL          → role + database, password synced from .env
 #   6.  DB connection test  → fail fast if creds are wrong
 #   7.  Django setup        → migrate / seed_legal / collectstatic / admin
+#   7b. Security migration  → add missing security env keys to .env
+#   7c. MFA detection       → auto-flip MFA_ENFORCE_FOR_STAFF once admin enrolls
 #   8.  Gunicorn service    → HTTP app server (port = unix socket)
 #   9.  Celery worker       → processes emails, provisioning, dunning
 #  10.  Celery beat         → schedules the daily lifecycle scan
 #  11.  Nginx config        → reverse proxy + static/media (HTTP only here)
 #  12.  SSL / HTTPS         → idempotent Certbot run (THE FIX for 400s)
 #  13.  Post-SSL hardening  → flip SECURE_SSL_REDIRECT + cookies if HTTPS OK
-#  14.  Health check        → verifies every public URL responds
+#  14.  Security check      → run Django's check --deploy + summarize
+#  15.  Health check        → verifies every public URL responds
+#  16.  Done                → prints action items
 #
-# The SSL step (12) is idempotent:
-#   - no cert yet           → issues one and patches nginx to add listen 443
-#   - cert exists, valid    → re-installs (fixes any missing listen 443 block)
-#   - cert close to expiry  → renews
-# This means re-running the deploy ALWAYS guarantees that ${DOMAIN} has a
-# proper HTTPS listener — preventing the "400 Bad Request" failure mode where
-# https://${DOMAIN}/ falls through to another site's default_server on 443.
-#
-# Idempotency notes:
+# Idempotency:
 #   - .env is never overwritten after first creation
+#   - new security env keys are APPENDED if missing (safe re-run)
 #   - git reset --hard origin/main (discards local edits to tracked files)
 #   - migrate is a fast no-op when schema is up to date
-#   - seed_legal skips any document that already exists
-#   - certbot --keep-until-expiring is safe to run daily (no-op when fresh)
+#   - seed_legal skips existing documents
+#   - certbot --keep-until-expiring is safe to run daily
 #
 # Requirements on the target box:
 #   - Ubuntu 22.04 / 24.04, run as root via SSH
@@ -89,13 +86,6 @@ ok "System dependencies verified."
 # ============================================================================
 # 1. Fetch Code
 # ============================================================================
-# `git reset --hard origin/main` makes the checkout match the repo exactly.
-# It DISCARDS local modifications to tracked files — commit and push any
-# hot-fixes before re-running.
-#
-# Untracked/git-ignored files are preserved: .env, venv/, media/,
-# staticfiles/, db.sqlite3, gunicorn.sock all survive a reset.
-# ============================================================================
 log "Step 1: Fetching source code"
 if [ ! -d "${PROJECT_DIR}/.git" ]; then
     mkdir -p "${PROJECT_DIR}"
@@ -131,10 +121,14 @@ ok "Python dependencies installed."
 # First run  → generate DB password + Django SECRET_KEY, write .env.
 # Re-runs    → preserve .env verbatim (never rotate secrets automatically).
 #
-# NOTE: SECURE_SSL_REDIRECT / SESSION_COOKIE_SECURE / CSRF_COOKIE_SECURE
-# start as False on purpose. Step 13 flips them to True ONLY after
-# verifying HTTPS actually works. This prevents the site from being
-# completely unusable if Certbot fails on the first deploy.
+# SECURITY DEFAULTS on first run:
+#   AXES_ENABLED=True            (brute-force protection is on by default)
+#   RATELIMIT_ENABLE=True        (rate limits are on by default)
+#   MFA_ENFORCE_FOR_STAFF=False  (flipped True by step 7c once admin enrolls)
+#   SECURE_SSL_REDIRECT=False    (flipped True by step 13 once HTTPS verified)
+#   SESSION_COOKIE_SECURE=False  (flipped True by step 13)
+#   CSRF_COOKIE_SECURE=False     (flipped True by step 13)
+#   SECURE_HSTS_SECONDS=0        (operator turns this on manually after 30d)
 # ============================================================================
 log "Step 3: Environment variables"
 if [ -f "${PROJECT_DIR}/.env" ]; then
@@ -180,6 +174,12 @@ EMAIL_USE_TLS=False
 DEFAULT_FROM_EMAIL=Pritech Host <noreply@pritechmw.com>
 SALES_EMAIL=sales@pritechmw.com
 
+# ── Google OAuth ────────────────────────────────────────────────────────────
+# Fill these in after creating a Google Cloud OAuth client.
+# Leave empty to disable Google SSO (staff login still works).
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+
 # ── Celery / Redis ──────────────────────────────────────────────────────────
 CELERY_BROKER_URL=redis://127.0.0.1:6379/0
 CELERY_RESULT_BACKEND=redis://127.0.0.1:6379/0
@@ -189,12 +189,32 @@ REDIS_CACHE_URL=redis://127.0.0.1:6379/1
 HESTIA_MOCK=True
 DUNNING_ENABLED=True
 
-# ── Security toggles (auto-managed by deploy Step 13) ───────────────────────
-# These will be flipped to True automatically once HTTPS is verified working.
-# Do NOT set them manually to True unless certbot has succeeded.
+# ── Security features (SRS NFR-9 to NFR-11) ─────────────────────────────────
+# Axes brute-force lockout: 5 failures → 1-hour lockout on IP+username.
+AXES_ENABLED=True
+
+# Rate limiting: per-view limits on payment, ticket, cookie endpoints.
+RATELIMIT_ENABLE=True
+
+# MFA enforcement: flipped True automatically by deploy step 7c once
+# the admin has enrolled in 2FA. Until then, staff can log in with
+# password only — which is fine because the admin hasn't got a TOTP
+# secret yet.
+MFA_ENFORCE_FOR_STAFF=False
+
+# ── HTTPS hardening (auto-managed by deploy step 13) ───────────────────────
+# These flip to True automatically once the script verifies that
+# https://${DOMAIN}/ returns 200 with the correct certificate.
 SECURE_SSL_REDIRECT=False
 SESSION_COOKIE_SECURE=False
 CSRF_COOKIE_SECURE=False
+
+# HSTS is intentionally 0 during the initial deploy. Do NOT enable
+# until HTTPS has been stable for at least 7 days — see the settings.py
+# rollout schedule. The operator enables this manually via:
+#   sed -i 's/^SECURE_HSTS_SECONDS=.*/SECURE_HSTS_SECONDS=3600/' .env
+# then increments gradually: 3600 → 86400 → 31536000.
+SECURE_HSTS_SECONDS=0
 EOF
     chmod 600 "${PROJECT_DIR}/.env"
     ok ".env created with generated secrets."
@@ -296,6 +316,101 @@ print("  ✔ Allauth Site domain updated to pritechhost.com")
 PY
 
 # ============================================================================
+# 7b. Security env keys — ADD MISSING ONES ON RE-RUN
+# ============================================================================
+# Existing deployments predate the security features. Rather than telling
+# the operator to manually add 6 env vars, we append them if missing.
+# `sed -i` on an existing key is only used in later steps (MFA, SSL) —
+# here we only ADD what's missing so we never override manual changes.
+# ============================================================================
+log "Step 7b: Ensuring security env keys are present"
+
+add_env_if_missing() {
+    local key="$1"
+    local default="$2"
+    if ! grep -q "^${key}=" "${PROJECT_DIR}/.env"; then
+        echo "${key}=${default}" >> "${PROJECT_DIR}/.env"
+        ok "  Added missing env key: ${key}=${default}"
+    fi
+}
+
+add_env_if_missing "AXES_ENABLED"             "True"
+add_env_if_missing "RATELIMIT_ENABLE"         "True"
+add_env_if_missing "MFA_ENFORCE_FOR_STAFF"    "False"
+add_env_if_missing "SECURE_HSTS_SECONDS"      "0"
+add_env_if_missing "SECURE_HSTS_INCLUDE_SUBDOMAINS" "False"
+add_env_if_missing "SECURE_HSTS_PRELOAD"      "False"
+add_env_if_missing "GOOGLE_CLIENT_ID"         ""
+add_env_if_missing "GOOGLE_CLIENT_SECRET"     ""
+
+ok "Security env keys verified."
+
+# ============================================================================
+# 7c. MFA ENFORCEMENT — auto-flip based on admin enrollment
+# ============================================================================
+# MFA_ENFORCE_FOR_STAFF=True locks every staff member out of the site
+# until they enroll in TOTP. If we enable it on first deploy, the admin
+# is instantly locked out — because they haven't enrolled yet.
+#
+# So we detect on every deploy:
+#   • Admin has enrolled    → set MFA_ENFORCE_FOR_STAFF=True (enforce!)
+#   • Admin has NOT enrolled → set MFA_ENFORCE_FOR_STAFF=False (bootstrap)
+#   • allauth.mfa broken   → leave as-is, warn loudly
+#
+# Enrollment is done once via:
+#   https://pritechhost.com/accounts/2fa/totp/activate/
+# (the URL is exempt from the middleware so the admin can reach it)
+# ============================================================================
+log "Step 7c: MFA enrollment detection"
+
+MFA_STATUS=$(python manage.py shell <<'PY' 2>/dev/null | tail -1
+try:
+    from allauth.mfa.models import Authenticator
+    from users.models import User
+    admin = User.objects.filter(is_superuser=True).first()
+    if not admin:
+        print("no_admin")
+    elif Authenticator.objects.filter(user=admin).exists():
+        print("enrolled")
+    else:
+        print("not_enrolled")
+except ImportError:
+    print("mfa_unavailable")
+except Exception:
+    print("error")
+PY
+)
+
+case "$MFA_STATUS" in
+    enrolled)
+        if grep -q '^MFA_ENFORCE_FOR_STAFF=False' "${PROJECT_DIR}/.env"; then
+            sed -i 's/^MFA_ENFORCE_FOR_STAFF=False/MFA_ENFORCE_FOR_STAFF=True/' "${PROJECT_DIR}/.env"
+            ok "Admin has MFA enrolled → MFA_ENFORCE_FOR_STAFF=True (enforced)."
+        else
+            ok "Admin has MFA enrolled → MFA already enforced."
+        fi
+        ;;
+    not_enrolled)
+        sed -i 's/^MFA_ENFORCE_FOR_STAFF=True/MFA_ENFORCE_FOR_STAFF=False/' "${PROJECT_DIR}/.env"
+        warn "Admin has NOT enrolled in MFA → enforcement OFF."
+        warn "  ⚠ ACTION: log in at https://${DOMAIN}/admin/, then visit"
+        warn "            https://${DOMAIN}/accounts/2fa/totp/activate/"
+        warn "            to enroll. Re-run this script to enforce MFA."
+        ;;
+    mfa_unavailable)
+        warn "allauth.mfa not installed → MFA enforcement unavailable."
+        warn "  Install with: pip install 'django-allauth[mfa]'"
+        ;;
+    no_admin)
+        warn "No superuser found — skipping MFA detection."
+        ;;
+    *)
+        warn "MFA status could not be determined (status=${MFA_STATUS})."
+        warn "  Check that allauth.mfa is installed and DB migrations succeeded."
+        ;;
+esac
+
+# ============================================================================
 # 8. Gunicorn Service
 # ============================================================================
 log "Step 8: Configuring Gunicorn"
@@ -392,10 +507,6 @@ ok "Celery beat configured and restarted."
 # ============================================================================
 # 11. Nginx Configuration (HTTP only)
 # ============================================================================
-# Certbot in Step 12 will patch this block to add `listen 443 ssl` and
-# a proper http→https redirect. We deliberately do NOT put those here so
-# that a fresh deploy is a valid HTTP-only state before any cert exists.
-# ============================================================================
 log "Step 11: Configuring Nginx"
 cat > /etc/nginx/sites-available/${PROJECT_NAME} <<EOF
 server {
@@ -420,8 +531,6 @@ EOF
 
 ln -sf /etc/nginx/sites-available/${PROJECT_NAME} /etc/nginx/sites-enabled/${PROJECT_NAME}
 
-# Verify config — and explicitly surface any server_name conflicts
-# (other sites on this shared server also claiming our domain or IP).
 if ! nginx -t 2>/tmp/nginx-t.log; then
     cat /tmp/nginx-t.log
     die "Nginx config failed — see above."
@@ -430,7 +539,6 @@ if grep -q "conflicting server name" /tmp/nginx-t.log; then
     warn "nginx reported server_name conflicts (other sites claiming ${DOMAIN} or ${SERVER_IP}):"
     grep "conflicting server name" /tmp/nginx-t.log | sort -u | sed 's/^/    /'
     warn "  This can cause HTTPS requests to hit the wrong backend."
-    warn "  Fix by editing server_name in the offending site's config."
 fi
 
 systemctl reload nginx
@@ -439,43 +547,19 @@ ok "Nginx reloaded."
 # ============================================================================
 # 12. SSL / HTTPS Provisioning (idempotent Certbot)
 # ============================================================================
-# THIS is the step that prevents the "400 Bad Request on https://" class of
-# failures. Without a `listen 443 ssl` block for ${DOMAIN}, nginx serves
-# requests to https://${DOMAIN}/ using whatever OTHER site happens to be
-# the default_server on port 443 — and that site's Django app rejects the
-# Host header (400 DisallowedHost).
-#
-# Certbot --nginx --keep-until-expiring is idempotent:
-#   - No cert yet                → issues one, patches nginx
-#   - Cert exists, fresh         → re-installs (fixes missing listen 443)
-#   - Cert close to expiry       → renews and re-installs
-#
-# We do NOT fail the whole deploy if certbot fails. The site can still
-# serve HTTP, and Step 13 keeps SECURE_SSL_REDIRECT=False so HTTP remains
-# usable while the operator investigates.
-# ============================================================================
 log "Step 12: SSL / HTTPS provisioning"
 
-# --- 12a. Pre-flight: nginx answering on loopback? ---
 if ! curl -sfI -H "Host: ${DOMAIN}" "http://127.0.0.1/" > /dev/null 2>&1; then
     warn "nginx is not answering ${DOMAIN} on loopback — Certbot will probably fail."
     warn "  Check: systemctl status nginx && journalctl -u nginx -n 30"
 fi
 
-# --- 12b. Report existing cert state ---
 if certbot certificates 2>/dev/null | grep -q "Certificate Name: ${DOMAIN}"; then
     ok "Existing certificate found for ${DOMAIN} — will reinstall/renew."
 else
     ok "No certificate yet — will issue one."
 fi
 
-# --- 12c. Run Certbot (non-interactive, idempotent) ---
-# Flags explained:
-#   --non-interactive      → never prompt (would hang under systemd/CI)
-#   --keep-until-expiring  → don't renew a fresh cert, but DO reinstall
-#                            to fix a missing listen 443 block
-#   --expand               → if we add domains in the future, expand the cert
-#   --redirect             → patch nginx to 301 http → https (idempotent)
 if certbot --nginx \
         -d "${DOMAIN}" \
         -d "${WWW_DOMAIN}" \
@@ -493,7 +577,6 @@ else
     warn "  Common causes: DNS not propagated, port 80 blocked, LE rate limit."
 fi
 
-# --- 12d. Verify the installed cert actually covers our domain ---
 CERT_CN=$(echo | openssl s_client -connect "${DOMAIN}:443" -servername "${DOMAIN}" 2>/dev/null \
           | openssl x509 -noout -subject 2>/dev/null \
           | sed -n 's/^subject=\?CN *= *//p' || echo "")
@@ -501,7 +584,6 @@ CERT_CN=$(echo | openssl s_client -connect "${DOMAIN}:443" -servername "${DOMAIN
 if [[ "${CERT_CN}" == *"${DOMAIN}"* ]]; then
     ok "HTTPS cert verified (subject=${CERT_CN})"
 
-    # --- 12e. Verify SANs include www variant ---
     CERT_SAN=$(echo | openssl s_client -connect "${DOMAIN}:443" -servername "${DOMAIN}" 2>/dev/null \
                | openssl x509 -noout -ext subjectAltName 2>/dev/null || echo "")
     if echo "${CERT_SAN}" | grep -q "DNS:${WWW_DOMAIN}"; then
@@ -512,13 +594,9 @@ if [[ "${CERT_CN}" == *"${DOMAIN}"* ]]; then
     fi
 else
     warn "Cert verification failed (subject was '${CERT_CN}', expected '${DOMAIN}')."
-    warn "  Run: certbot certificates — HTTPS may not work correctly yet."
 fi
 
-# --- 12f. Detect other sites on this server whose certs will fail renewal ---
-# On a shared VPS, other projects' certs can have stale DNS pointing to
-# different servers. Their renewal timer will fail daily. We can't fix them
-# (they belong to other projects), but the operator should know.
+# Detect other sites on this server whose certs will fail renewal
 FAILED_EXTERNAL=""
 for conf in /etc/letsencrypt/renewal/*.conf; do
     [[ -f "$conf" ]] || continue
@@ -526,7 +604,6 @@ for conf in /etc/letsencrypt/renewal/*.conf; do
     [[ "$cert_name" == "$DOMAIN" ]] && continue
     [[ "$cert_name" == "$WWW_DOMAIN" ]] && continue
 
-    # Get the first non-www domain from this cert config
     primary_domain=$(grep -oP '^domains\s*=\s*\K[^,\s]+' "$conf" 2>/dev/null | head -1 || echo "$cert_name")
     dns_ip=$(dig +short "$primary_domain" A 2>/dev/null | head -1 || true)
 
@@ -541,21 +618,11 @@ if [[ -n "$FAILED_EXTERNAL" ]]; then
     warn "Other domains on this server have broken cert renewals:"
     printf "%b" "$FAILED_EXTERNAL" | sed 's/^/    /'
     warn "  Their renewals fail daily but don't affect ${DOMAIN}."
-    warn "  To silence, either fix their DNS or remove with:"
-    warn "    certbot delete --cert-name <name>"
+    warn "  Silence with: certbot delete --cert-name <name>"
 fi
 
 # ============================================================================
 # 13. Post-SSL Hardening
-# ============================================================================
-# Set SECURE_SSL_REDIRECT and the secure-cookie flags to reflect ACTUAL
-# HTTPS status, not aspiration:
-#   - HTTPS verified working    → set all three to True (browser-side safety)
-#   - HTTPS not working         → set all three to False (site serves via HTTP)
-#
-# This is what saves the deploy from bricking the site when Certbot fails
-# on first run — the .env template starts with all flags False; we only
-# flip them on after confirming HTTPS responds with 200.
 # ============================================================================
 log "Step 13: Post-SSL hardening"
 
@@ -577,13 +644,49 @@ systemctl restart gunicorn-${PROJECT_NAME} celery-${PROJECT_NAME} celery-beat-${
 ok "Services restarted to pick up the new .env values."
 
 # ============================================================================
-# 14. Health Check
+# 14. Django check --deploy
 # ============================================================================
-# Verifies the site responds through nginx → gunicorn → Django, and that
-# the seeded legal pages are actually 200. Uses a relaxed matcher for HTTP
-# so it works both pre-Certbot (200 direct) and post-Certbot (301 → HTTPS).
+# Django's `check --deploy` audits the settings for production
+# readiness. It emits WARNING-level issues for insecure defaults like
+# `DEBUG=True`, missing HTTPS redirects, or weak SECRET_KEY.
+#
+# With our config:
+#   • After step 13 succeeds → 0 warnings
+#   • Before HTTPS is verified → warnings about cookies/redirects
+#   • Always: SECURE_HSTS_SECONDS warning if HSTS is 0
+#     (this is INTENTIONAL — see the settings.py rollout schedule)
+#
+# We don't fail on warnings — the operator decides.
 # ============================================================================
-log "Step 14: Health check"
+log "Step 14: Django deployment check"
+
+DEPLOY_CHECK_LOG=/tmp/django-check-deploy.log
+if python manage.py check --deploy > "${DEPLOY_CHECK_LOG}" 2>&1; then
+    WARNING_COUNT=$(grep -c "WARNINGS:" "${DEPLOY_CHECK_LOG}" || echo "0")
+    if [[ "${WARNING_COUNT}" -gt 0 ]] && ! grep -q "0 silenced" <(grep "System check identified" "${DEPLOY_CHECK_LOG}" || echo ""); then
+        warn "check --deploy reported configuration warnings:"
+        grep -E "^\s*[?]|WARNINGS:" "${DEPLOY_CHECK_LOG}" | sed 's/^/    /' | head -10
+        warn "  Full log: ${DEPLOY_CHECK_LOG}"
+    else
+        ok "check --deploy passed (0 issues)."
+    fi
+else
+    warn "check --deploy failed — investigate before going live:"
+    sed 's/^/    /' "${DEPLOY_CHECK_LOG}" | tail -20
+fi
+
+# Expect a warning about SECURE_HSTS_SECONDS=0 until the operator
+# enables HSTS after 30+ days of stable HTTPS. That's intentional.
+if grep -q "SECURE_HSTS_SECONDS" "${DEPLOY_CHECK_LOG}" 2>/dev/null; then
+    warn "  ℹ  SECURE_HSTS_SECONDS=0 warning is INTENTIONAL."
+    warn "     Enable HSTS manually after 30 days of stable HTTPS. See"
+    warn "     settings.py section 15 for the safe rollout schedule."
+fi
+
+# ============================================================================
+# 15. Health Check
+# ============================================================================
+log "Step 15: Health check"
 
 check_url() {
     local scheme="$1"
@@ -607,18 +710,25 @@ check_url() {
     esac
 }
 
-# Homepage: 200 (HTTP direct) or 301/302 (redirect to HTTPS)
 check_url "http"  "/"               "200 301 302"
 check_url "https" "/"               "200"
-
-# Legal pages — proves seed_legal worked
 check_url "https" "/legal/terms/"   "200"
 check_url "https" "/legal/privacy/" "200"
 check_url "https" "/legal/aup/"     "200"
 check_url "https" "/legal/refund/"  "200"
-
-# Admin — proves Django + session stack works
 check_url "https" "/admin/login/"   "200"
+
+# Security headers — spot-check that they're actually being emitted
+HDRS=$(curl -skI --max-time 5 "https://${DOMAIN}/" 2>/dev/null)
+for hdr in "X-Content-Type-Options: nosniff" \
+           "X-Frame-Options: SAMEORIGIN" \
+           "Referrer-Policy: same-origin"; do
+    if echo "$HDRS" | grep -qi "${hdr%:*}:"; then
+        ok "Header present: ${hdr}"
+    else
+        warn "Header MISSING: ${hdr}"
+    fi
+done
 
 # ============================================================================
 # Done
@@ -635,14 +745,20 @@ for svc in gunicorn-${PROJECT_NAME} celery-${PROJECT_NAME} celery-beat-${PROJECT
     fi
 done
 
-# Report SSL status in the final summary
 if curl -sfI --max-time 5 "https://${DOMAIN}/" >/dev/null 2>&1; then
     ok "HTTPS is active and verified."
     SSL_STATUS="ACTIVE"
 else
     warn "HTTPS is NOT active — site serves via HTTP only."
-    warn "  Fix: certbot --nginx -d ${DOMAIN} -d ${WWW_DOMAIN} --agree-tos --redirect --email ${ADMIN_EMAIL}"
     SSL_STATUS="NOT ACTIVE"
+fi
+
+# Report MFA enforcement state
+MFA_STATE=$(grep '^MFA_ENFORCE_FOR_STAFF=' "${PROJECT_DIR}/.env" | cut -d= -f2)
+if [[ "${MFA_STATE}" == "True" ]]; then
+    MFA_LINE="✔ ENFORCED (staff must use TOTP)"
+else
+    MFA_LINE="⚠ NOT ENFORCED — enroll admin at /accounts/2fa/totp/activate/, then re-run"
 fi
 
 cat <<EOF
@@ -651,6 +767,7 @@ cat <<EOF
   Admin:     https://${DOMAIN}/admin/
   Login:     admin@pritechhost.com / ChangeMe123!
   HTTPS:     ${SSL_STATUS}
+  2FA:       ${MFA_LINE}
 
   Logs:
     Gunicorn : journalctl -u gunicorn-${PROJECT_NAME} -f
@@ -660,15 +777,41 @@ cat <<EOF
     Certbot  : journalctl -u certbot -f
 
   ⚠  ACTION REQUIRED:
-     1. Change the admin password immediately (ChangeMe123! is public).
-     2. Have a Malawi lawyer review the seeded legal documents in
-        /admin/ → Legal Documents before going live. The seeded text
-        is a structural starting point, not legal advice.
-     3. Fill in real EMAIL_HOST_PASSWORD and PAYCHANGU_* values in
-        ${PROJECT_DIR}/.env, then:
-          systemctl restart gunicorn-${PROJECT_NAME} celery-${PROJECT_NAME} celery-beat-${PROJECT_NAME}
+
+     1. CHANGE THE ADMIN PASSWORD IMMEDIATELY.
+        ChangeMe123! is public. Log in and change it before anything else.
+
+     2. ENROLL ADMIN IN 2FA, THEN RE-RUN THIS SCRIPT.
+        1. Log in at https://${DOMAIN}/admin/
+        2. Visit https://${DOMAIN}/accounts/2fa/totp/activate/
+        3. Scan the QR code with Google Authenticator / Authy / 1Password
+        4. Save the recovery codes somewhere safe
+        5. Re-run this script — it will auto-enable MFA enforcement
+
+     3. HAVE A MALAWI LAWYER REVIEW THE LEGAL DOCUMENTS.
+        /admin/ → Legal Documents contains placeholder Terms, Privacy,
+        AUP, and Refund Policy. They are a structural starting point,
+        not legal advice.
+
+     4. FILL IN REAL PAYCHANGU CREDENTIALS.
+        PAYCHANGU_SECRET_KEY and PAYCHANGU_WEBHOOK_SECRET in .env are
+        placeholders. Copy the real values from the PayChangu dashboard
+        → Settings → API Keys, then:
+          systemctl restart gunicorn-${PROJECT_NAME} celery-${PROJECT_NAME}
+
+     5. FILL IN REAL EMAIL CREDENTIALS.
+        EMAIL_HOST_PASSWORD in .env is `change-me`. Use the real cPanel
+        mailbox password, then restart the same three services.
+
+     6. CONFIGURE GOOGLE OAUTH (optional).
+        GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in .env are empty.
+        See https://console.cloud.google.com/apis/credentials.
 
   Certbot auto-renewal runs daily via systemd timer:
     systemctl list-timers | grep certbot
+
+  When you're ready to enable HSTS (after 30 days of stable HTTPS):
+    sed -i 's/^SECURE_HSTS_SECONDS=.*/SECURE_HSTS_SECONDS=3600/' ${PROJECT_DIR}/.env
+    # wait one week, then 86400, then 31536000
 
 EOF

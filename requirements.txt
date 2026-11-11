@@ -11,18 +11,24 @@ whitenoise
 psycopg2-binary
 
 # ==============================================================================
-# Authentication & Social Login
+# Authentication & SSO
 # ==============================================================================
-django-allauth
-django-allauth[socialaccount]
+# socialaccount → Google login
+# mfa           → TOTP 2FA (SRS NFR-9)
+django-allauth[socialaccount,mfa]
+
+# ==============================================================================
+# Security
+# ==============================================================================
+# axes        → brute-force lockout (SRS NFR-10)
+# ratelimit   → per-view rate limiting (SRS NFR-11)
+django-axes
+django-ratelimit
 
 # ==============================================================================
 # Admin Interface (Unfold)
 # ==============================================================================
 django-unfold
-django-unfold[filters]
-django-unfold[forms]
-django-unfold[inlines]
 
 # ==============================================================================
 # Utilities & Integrations
@@ -37,7 +43,7 @@ pillow
 gunicorn
 
 # ==============================================================================
-# Background Tasks (Celery & Redis - ready for future async features)
+# Background Tasks (Celery & Redis)
 # ==============================================================================
 celery
 redis
