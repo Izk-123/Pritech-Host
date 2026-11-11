@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html>
+<body style="font-family: Arial, sans-serif; background:#F7FAFD; padding:20px; margin:0;">
+  <div style="max-width:600px; margin:0 auto; background:#fff; border-radius:12px; overflow:hidden; border:1px solid #E1EAF2;">
+    <div style="background:#16365F; padding:20px; text-align:center;">
+      <h1 style="color:#fff; margin:0; font-size:22px;">Pritech Host Support</h1>
+    </div>
+    <div style="padding:30px;">
+      <h2 style="color:#16365F; margin-top:0;">New reply on ticket #{{ ticket_id }}</h2>
+      <p style="color:#5B6B7C; font-size:16px; line-height:1.5;">
+        Hi {{ customer_name }},<br><br>
+        Our team has replied to your support ticket <strong>{{ ticket_subject }}</strong>.
+      </p>
+
+      <div style="background:#F7FAFD; border-left:4px solid #1478C4; padding:16px; margin:20px 0; border-radius:8px;">
+        <p style="color:#16365F; font-size:15px; line-height:1.6; white-space:pre-wrap; margin:0;">{{ reply_message }}</p>
+      </div>
+
+      <div style="text-align:center; margin-top:25px;">
+        <a href="{{ ticket_url }}" style="background:#1478C4; color:#fff; padding:12px 28px; border-radius:8px; font-weight:bold; text-decoration:none; display:inline-block;">
+          View & Reply in Dashboard
+        </a>
+      </div>
+
+      <p style="color:#9CA3AF; font-size:12px; margin-top:30px;">
+        You can reply to this email directly, or reply from your dashboard. Do not reply if this is the final message and the ticket has been closed.
+      </p>
+    </div>
+    <div style="background:#F7FAFD; padding:15px; text-align:center; color:#9CA3AF; font-size:12px;">
+      &copy; 2026 Pritech ICT Solutions · info@pritechmw.com
+    </div>
+  </div>
+</body>
+</html>

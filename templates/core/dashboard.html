@@ -32,20 +32,22 @@
     }).format(num || 0);
 
     // ==================================================================
-    // Reusable primitives (unchanged)
+    // Reusable primitives
     // ==================================================================
     const Skeleton = ({ className }) => (
         <div className={`animate-pulse bg-gray-200 rounded-lg ${className}`} />
     );
 
-    const Modal = ({ isOpen, onClose, title, children }) => {
+    // Modal now takes an optional maxWidth so we can render the
+    // ticket thread wider than the standard small modal.
+    const Modal = ({ isOpen, onClose, title, children, maxWidth = 'max-w-md' }) => {
         if (!isOpen) return null;
         return (
             <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-navy/50 backdrop-blur-sm">
                 <motion.div
                     initial={{ opacity: 0, scale: 0.95 }}
                     animate={{ opacity: 1, scale: 1 }}
-                    className="bg-white rounded-[18px] p-6 w-full max-w-md shadow-xl"
+                    className={`bg-white rounded-[18px] p-6 w-full ${maxWidth} shadow-xl`}
                 >
                     <div className="flex justify-between items-center mb-4">
                         <h2 className="text-xl font-heading font-bold text-navy">{title}</h2>
@@ -69,23 +71,27 @@
         );
     };
 
-    const TicketStatusBadge = ({ status, label }) => (
-        <span className={`px-2.5 py-1 rounded-full text-[10px] md:text-xs font-bold ${
-            status === 'open' ? 'bg-yellow-100 text-yellow-700' : 'bg-green-100 text-green-700'
-        }`}>
-            {label}
-        </span>
-    );
+    // Now supports the three ticket statuses introduced with FR-46.
+    const TicketStatusBadge = ({ status, label }) => {
+        const styles = {
+            open:              'bg-yellow-100 text-yellow-700',
+            awaiting_customer: 'bg-blue-100 text-blue-700',
+            closed:            'bg-green-100 text-green-700',
+        };
+        return (
+            <span className={`px-2.5 py-1 rounded-full text-[10px] md:text-xs font-bold ${styles[status] || 'bg-gray-100'}`}>
+                {label}
+            </span>
+        );
+    };
 
     // ==================================================================
-    // Renewal banner — decides between the 5 possible renewal states.
+    // Renewal banner (unchanged)
     // ==================================================================
     const RenewalBanner = ({ renewal, onPayNow }) => {
         if (!renewal) return null;
-
         const days = renewal.days_until_expiry;
 
-        // ── 1. Deletion scheduled (day 30+ past expiry) ──
         if (renewal.scheduled_deletion_at) {
             return (
                 <motion.div
@@ -95,15 +101,11 @@
                     <span className="text-2xl">🚨</span>
                     <div className="flex-1">
                         <p className="font-bold">Account scheduled for deletion on {renewal.scheduled_deletion_at}</p>
-                        <p className="text-sm">
-                            Your files will be permanently deleted unless the outstanding invoice is paid.
-                        </p>
+                        <p className="text-sm">Your files will be permanently deleted unless the outstanding invoice is paid.</p>
                     </div>
                     {renewal.has_pending_renewal && (
-                        <button
-                            onClick={() => onPayNow(renewal.renewal_invoice_id)}
-                            className="bg-red-700 text-white font-semibold px-4 py-2 rounded-lg hover:bg-red-800 whitespace-nowrap"
-                        >
+                        <button onClick={() => onPayNow(renewal.renewal_invoice_id)}
+                            className="bg-red-700 text-white font-semibold px-4 py-2 rounded-lg hover:bg-red-800 whitespace-nowrap">
                             Renew Now
                         </button>
                     )}
@@ -111,7 +113,6 @@
             );
         }
 
-        // ── 2. Expired (0+ days past expiry) ──
         if (renewal.is_expired) {
             return (
                 <motion.div
@@ -120,9 +121,7 @@
                 >
                     <span className="text-2xl">⚠️</span>
                     <div className="flex-1">
-                        <p className="font-semibold">
-                            Your subscription expired {Math.abs(days)} day{Math.abs(days) === 1 ? '' : 's'} ago.
-                        </p>
+                        <p className="font-semibold">Your subscription expired {Math.abs(days)} day{Math.abs(days) === 1 ? '' : 's'} ago.</p>
                         <p className="text-sm">
                             {renewal.is_in_grace_period
                                 ? 'Your account will be suspended in a few days. Please renew now.'
@@ -130,10 +129,8 @@
                         </p>
                     </div>
                     {renewal.has_pending_renewal && (
-                        <button
-                            onClick={() => onPayNow(renewal.renewal_invoice_id)}
-                            className="bg-red-600 text-white font-semibold px-4 py-2 rounded-lg hover:bg-red-700 whitespace-nowrap"
-                        >
+                        <button onClick={() => onPayNow(renewal.renewal_invoice_id)}
+                            className="bg-red-600 text-white font-semibold px-4 py-2 rounded-lg hover:bg-red-700 whitespace-nowrap">
                             Renew Now
                         </button>
                     )}
@@ -141,7 +138,6 @@
             );
         }
 
-        // ── 3. Approaching renewal (0-30 days, invoice pending) ──
         if (days <= 30 && renewal.has_pending_renewal) {
             return (
                 <motion.div
@@ -150,24 +146,17 @@
                 >
                     <span className="text-2xl">🔔</span>
                     <div className="flex-1">
-                        <p className="font-semibold">
-                            Your plan renews in {days} day{days === 1 ? '' : 's'} ({renewal.end_date}).
-                        </p>
-                        <p className="text-sm">
-                            Pay your renewal invoice now to keep your website online.
-                        </p>
+                        <p className="font-semibold">Your plan renews in {days} day{days === 1 ? '' : 's'} ({renewal.end_date}).</p>
+                        <p className="text-sm">Pay your renewal invoice now to keep your website online.</p>
                     </div>
-                    <button
-                        onClick={() => onPayNow(renewal.renewal_invoice_id)}
-                        className="bg-yellow-600 text-white font-semibold px-4 py-2 rounded-lg hover:bg-yellow-700 whitespace-nowrap"
-                    >
+                    <button onClick={() => onPayNow(renewal.renewal_invoice_id)}
+                        className="bg-yellow-600 text-white font-semibold px-4 py-2 rounded-lg hover:bg-yellow-700 whitespace-nowrap">
                         Renew Now
                     </button>
                 </motion.div>
             );
         }
 
-        // ── 4. Suspended (subscription.status = 'suspended') ──
         if (renewal.status === 'suspended') {
             return (
                 <motion.div
@@ -267,6 +256,13 @@
         const [isPaying, setIsPaying]         = useState(false);
         const [ticketData, setTicketData]     = useState({ subject: '', message: '' });
 
+        // ─── Ticket thread modal state (SRS FR-46) ─────────────────────
+        const [openTicketId, setOpenTicketId] = useState(null);
+        const [ticketThread, setTicketThread] = useState(null);
+        const [ticketLoading, setTicketLoading] = useState(false);
+        const [replyMessage, setReplyMessage]   = useState('');
+        const [sendingReply, setSendingReply]   = useState(false);
+
         const queryParams   = new URLSearchParams(window.location.search);
         const paymentStatus = queryParams.get('payment');
         const [showSuccessBanner, setShowSuccessBanner] = useState(paymentStatus === 'success');
@@ -341,6 +337,66 @@
             });
         };
 
+        // ─── Open ticket thread ───────────────────────────────────────
+        // Marks staff replies as read on the server (side effect of GET).
+        // Then refreshes the dashboard so the unread badge clears.
+        const openTicket = (ticketId) => {
+            setOpenTicketId(ticketId);
+            setTicketThread(null);
+            setTicketLoading(true);
+            setReplyMessage('');
+
+            fetch(`/api/tickets/${ticketId}/`)
+                .then(res => res.json())
+                .then(d => {
+                    if (d.error) {
+                        alert(d.error);
+                        setOpenTicketId(null);
+                    } else {
+                        setTicketThread(d);
+                    }
+                    setTicketLoading(false);
+                    fetchData();   // clears the unread badge
+                })
+                .catch(() => {
+                    setTicketLoading(false);
+                    setOpenTicketId(null);
+                });
+        };
+
+        // ─── Send a customer reply ────────────────────────────────────
+        // On success: append the reply locally (instant feedback) and
+        // refresh dashboard state (status may have flipped to 'open').
+        const handleSendReply = (e) => {
+            e.preventDefault();
+            if (!replyMessage.trim() || !openTicketId) return;
+
+            setSendingReply(true);
+            fetch(`/api/tickets/${openTicketId}/reply/`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRFToken': CSRF_TOKEN,
+                },
+                body: JSON.stringify({ message: replyMessage }),
+            })
+            .then(res => res.json())
+            .then(d => {
+                if (d.success) {
+                    setTicketThread(prev => ({
+                        ...prev,
+                        replies: [...prev.replies, d.reply],
+                    }));
+                    setReplyMessage('');
+                    fetchData();
+                } else {
+                    alert(d.error || 'Failed to send reply');
+                }
+            })
+            .catch(() => alert('Network error — could not send reply.'))
+            .finally(() => setSendingReply(false));
+        };
+
         if (loading) {
             return (
                 <div className="h-screen bg-bg flex flex-col md:flex-row p-6 gap-6">
@@ -364,10 +420,10 @@
                         <div className="text-red-500 mb-4 text-4xl">⚠️</div>
                         <h1 className="text-xl font-bold text-navy mb-2">Oops!</h1>
                         <p className="text-muted mb-6">{error}</p>
-                        <button
-                            onClick={() => window.location.reload()}
-                            className="bg-brand text-white px-6 py-3 rounded-xl font-semibold hover:bg-brand-hover"
-                        >Refresh Page</button>
+                        <button onClick={() => window.location.reload()}
+                            className="bg-brand text-white px-6 py-3 rounded-xl font-semibold hover:bg-brand-hover">
+                            Refresh Page
+                        </button>
                     </div>
                 </div>
             );
@@ -409,7 +465,7 @@
                 <main className="flex-1 h-full overflow-y-auto bg-bg relative">
                     <div className="p-4 md:p-8 flex flex-col gap-6 w-full max-w-[1200px] mx-auto pb-24 md:pb-8">
 
-                        {/* Payment-success banner (unchanged) */}
+                        {/* Success banner */}
                         {showSuccessBanner && (
                             <motion.div
                                 initial={{ opacity: 0, y: -20 }} animate={{ opacity: 1, y: 0 }}
@@ -435,27 +491,23 @@
                             </p>
                         </div>
 
-                        {/* ────────── RENEWAL BANNER (NEW) ────────── */}
+                        {/* Renewal banner */}
                         <RenewalBanner renewal={data.renewal} onPayNow={handlePayNow} />
 
                         {/* Project timeline */}
                         {data.project && <ProjectTimeline currentStage={data.project.stage} />}
 
-                        {/* Package / Hosting / Usage (unchanged) */}
+                        {/* Package / Hosting / Usage */}
                         <div className="grid grid-cols-1 md:grid-cols-3 gap-4 md:gap-6">
                             <div className="bg-white border border-border rounded-[18px] p-6 flex flex-col gap-2 shadow-sm">
                                 <span className="text-sm text-muted font-medium">Current package</span>
                                 {data.subscription ? (
                                     <>
-                                        <h2 className="text-2xl font-heading font-bold text-navy">
-                                            {data.subscription.plan_name}
-                                        </h2>
+                                        <h2 className="text-2xl font-heading font-bold text-navy">{data.subscription.plan_name}</h2>
                                         <p className="text-sm">
                                             MWK {Number(data.subscription.price).toLocaleString()} / {data.subscription.billing_period}
                                         </p>
-                                        <span className="bg-green-100 text-green-700 px-3 py-1 rounded-full text-xs font-bold self-start mt-2">
-                                            Active
-                                        </span>
+                                        <span className="bg-green-100 text-green-700 px-3 py-1 rounded-full text-xs font-bold self-start mt-2">Active</span>
                                     </>
                                 ) : (
                                     <h2 className="text-lg font-heading font-bold text-navy">No Active Plan</h2>
@@ -470,19 +522,15 @@
                                         {data.hestia_username && (
                                             <p className="text-xs text-muted mb-4">User: {data.hestia_username}</p>
                                         )}
-                                        <a
-                                            href={data.site.cpanel_url}
-                                            target="_blank"
-                                            rel="noreferrer"
-                                            className="bg-brand text-white text-center text-sm font-semibold py-2 rounded-lg hover:bg-brand-hover mt-auto"
-                                        >Login to cPanel</a>
+                                        <a href={data.site.cpanel_url} target="_blank" rel="noreferrer"
+                                            className="bg-brand text-white text-center text-sm font-semibold py-2 rounded-lg hover:bg-brand-hover mt-auto">
+                                            Login to cPanel
+                                        </a>
                                     </>
                                 ) : data.hosting_status === 'provisioning' ? (
                                     <div className="flex flex-col items-center justify-center h-full gap-3 py-2">
                                         <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-brand"></div>
-                                        <p className="text-xs text-muted text-center">
-                                            Setting up your server...<br />This takes ~2 minutes.
-                                        </p>
+                                        <p className="text-xs text-muted text-center">Setting up your server...<br />This takes ~2 minutes.</p>
                                     </div>
                                 ) : (
                                     <div className="flex flex-col items-center justify-center h-full text-center py-2">
@@ -517,7 +565,7 @@
                             </div>
                         </div>
 
-                        {/* Recent invoices + Next invoice + Domain (unchanged) */}
+                        {/* Invoices + Next invoice + Domain */}
                         <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
                             <div className="bg-white border border-border rounded-[18px] p-6 md:col-span-2 shadow-sm">
                                 <h2 className="text-lg font-heading font-bold text-navy mb-4">Recent Invoices</h2>
@@ -531,10 +579,10 @@
                                             MWK {Number(inv.amount).toLocaleString()}
                                         </span>
                                         <InvoiceStatusBadge status={inv.status} />
-                                        <a
-                                            href={`/invoices/${inv.id}/pdf/`}
-                                            className="text-brand text-sm font-semibold hover:underline whitespace-nowrap"
-                                        >{inv.status === 'PAID' ? 'Receipt' : 'Invoice PDF'}</a>
+                                        <a href={`/invoices/${inv.id}/pdf/`}
+                                            className="text-brand text-sm font-semibold hover:underline whitespace-nowrap">
+                                            {inv.status === 'PAID' ? 'Receipt' : 'Invoice PDF'}
+                                        </a>
                                     </div>
                                 )) : (
                                     <p className="text-sm text-muted py-4">No invoices found.</p>
@@ -545,48 +593,64 @@
                                 {data.next_invoice && (
                                     <div className="bg-white border-2 border-brand rounded-[18px] p-6 shadow-sm flex flex-col gap-3">
                                         <span className="text-sm text-muted font-medium">Next invoice</span>
-                                        <h2 className="text-2xl font-heading font-bold text-navy">
-                                            {fmt(data.next_invoice.amount)}
-                                        </h2>
-                                        <p className="text-xs">
-                                            {data.next_invoice.number}, due {data.next_invoice.due_date}.
-                                        </p>
-                                        <button
-                                            onClick={() => handlePayNow(data.next_invoice.id)}
-                                            disabled={isPaying}
-                                            className="bg-brand text-white font-semibold py-2.5 rounded-xl hover:bg-brand-hover mt-2 disabled:opacity-50"
-                                        >{isPaying ? 'Processing...' : 'Pay now'}</button>
+                                        <h2 className="text-2xl font-heading font-bold text-navy">{fmt(data.next_invoice.amount)}</h2>
+                                        <p className="text-xs">{data.next_invoice.number}, due {data.next_invoice.due_date}.</p>
+                                        <button onClick={() => handlePayNow(data.next_invoice.id)} disabled={isPaying}
+                                            className="bg-brand text-white font-semibold py-2.5 rounded-xl hover:bg-brand-hover mt-2 disabled:opacity-50">
+                                            {isPaying ? 'Processing...' : 'Pay now'}
+                                        </button>
                                     </div>
                                 )}
                                 <div className="bg-white border border-border rounded-[18px] p-6 shadow-sm">
                                     <h2 className="text-lg font-heading font-bold text-navy mb-2">Domain</h2>
-                                    <p className="text-sm">
-                                        {data.project?.domain || 'No domain connected yet.'}
-                                    </p>
+                                    <p className="text-sm">{data.project?.domain || 'No domain connected yet.'}</p>
                                 </div>
                             </div>
                         </div>
 
-                        {/* Support tickets (unchanged) */}
+                        {/* ============ SUPPORT TICKETS (clickable) ============ */}
                         <div className="bg-white border border-border rounded-[18px] p-6 shadow-sm">
                             <div className="flex justify-between items-center mb-4">
                                 <h2 className="text-lg font-heading font-bold text-navy">Support Tickets</h2>
-                                {data.open_tickets_count > 0 && (
-                                    <span className="bg-yellow-100 text-yellow-700 px-2.5 py-1 rounded-full text-xs font-bold">
-                                        {data.open_tickets_count} open
-                                    </span>
-                                )}
+                                <div className="flex items-center gap-2">
+                                    {data.unread_replies_total > 0 && (
+                                        <span className="bg-red-100 text-red-700 px-2.5 py-1 rounded-full text-xs font-bold">
+                                            {data.unread_replies_total} new {data.unread_replies_total === 1 ? 'reply' : 'replies'}
+                                        </span>
+                                    )}
+                                    {data.open_tickets_count > 0 && (
+                                        <span className="bg-yellow-100 text-yellow-700 px-2.5 py-1 rounded-full text-xs font-bold">
+                                            {data.open_tickets_count} open
+                                        </span>
+                                    )}
+                                </div>
                             </div>
                             {(data.tickets || []).length > 0 ? (
                                 <div className="flex flex-col">
                                     {data.tickets.map((t) => (
-                                        <div key={t.id} className="flex justify-between py-3 border-b last:border-0 items-center gap-3">
-                                            <div className="min-w-0">
-                                                <p className="font-semibold text-sm text-navy truncate">#{t.id} — {t.subject}</p>
-                                                <p className="text-xs text-muted">{t.created_at}</p>
+                                        <button
+                                            key={t.id}
+                                            onClick={() => openTicket(t.id)}
+                                            className="flex justify-between items-center gap-3 py-3 border-b last:border-0 text-left w-full hover:bg-gray-50 transition-colors rounded-lg px-2 -mx-2"
+                                        >
+                                            <div className="min-w-0 flex-1">
+                                                <p className="font-semibold text-sm text-navy truncate">
+                                                    #{t.id} — {t.subject}
+                                                </p>
+                                                <p className="text-xs text-muted truncate">{t.last_preview}</p>
+                                                <p className="text-xs text-gray-400 mt-1">
+                                                    {t.reply_count} {t.reply_count === 1 ? 'reply' : 'replies'} · updated {t.updated_at}
+                                                </p>
                                             </div>
-                                            <TicketStatusBadge status={t.status} label={t.status_display} />
-                                        </div>
+                                            <div className="flex flex-col items-end gap-1 flex-shrink-0">
+                                                <TicketStatusBadge status={t.status} label={t.status_display} />
+                                                {t.unread_replies > 0 && (
+                                                    <span className="bg-red-500 text-white text-[10px] font-bold rounded-full min-w-[18px] h-[18px] flex items-center justify-center px-1">
+                                                        {t.unread_replies}
+                                                    </span>
+                                                )}
+                                            </div>
+                                        </button>
                                     ))}
                                 </div>
                             ) : (
@@ -594,13 +658,11 @@
                             )}
                         </div>
 
-                        {/* Support banner (unchanged) */}
+                        {/* Support banner */}
                         <div className="bg-navy text-white rounded-[18px] p-6 flex flex-col md:flex-row items-center justify-between gap-4 shadow-lg mt-2">
                             <div>
                                 <h2 className="text-lg font-heading font-bold mb-1">Need help?</h2>
-                                <p className="text-navy-text text-sm">
-                                    Our support team is available {data.site.support_hours}.
-                                </p>
+                                <p className="text-navy-text text-sm">Our support team is available {data.site.support_hours}.</p>
                                 <p className="text-navy-text text-xs mt-1">
                                     <a href={`mailto:${data.site.contact_email}`} className="hover:text-white underline-offset-2 hover:underline">
                                         {data.site.contact_email}
@@ -611,15 +673,15 @@
                                     </a>
                                 </p>
                             </div>
-                            <button
-                                onClick={() => setIsTicketOpen(true)}
-                                className="bg-white text-navy font-semibold px-6 py-3 rounded-xl hover:bg-gray-100 w-full md:w-auto transition-colors"
-                            >Open a ticket</button>
+                            <button onClick={() => setIsTicketOpen(true)}
+                                className="bg-white text-navy font-semibold px-6 py-3 rounded-xl hover:bg-gray-100 w-full md:w-auto transition-colors">
+                                Open a ticket
+                            </button>
                         </div>
                     </div>
                 </main>
 
-                {/* Mobile bottom nav (unchanged) */}
+                {/* Mobile bottom nav */}
                 <div className="fixed bottom-0 left-0 w-full bg-white border-t border-border flex justify-around items-center py-2 px-2 md:hidden z-50 shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.05)]">
                     <a href="#" className="flex flex-col items-center gap-1 text-brand">
                         <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -641,32 +703,111 @@
                     </a>
                 </div>
 
-                {/* Ticket modal (unchanged) */}
+                {/* ============ Create-ticket modal (unchanged) ============ */}
                 <Modal isOpen={isTicketOpen} onClose={() => setIsTicketOpen(false)} title="Open a Support Ticket">
                     <form onSubmit={handleCreateTicket} className="flex flex-col gap-4">
                         <div>
                             <label className="text-sm font-semibold text-navy">Subject</label>
-                            <input
-                                type="text" required
+                            <input type="text" required
                                 className="w-full border border-border rounded-lg p-3 mt-1 focus:outline-none focus:border-brand"
                                 value={ticketData.subject}
-                                onChange={(e) => setTicketData({ ...ticketData, subject: e.target.value })}
-                            />
+                                onChange={(e) => setTicketData({ ...ticketData, subject: e.target.value })} />
                         </div>
                         <div>
                             <label className="text-sm font-semibold text-navy">Message</label>
-                            <textarea
-                                required rows="4"
+                            <textarea required rows="4"
                                 className="w-full border border-border rounded-lg p-3 mt-1 focus:outline-none focus:border-brand"
                                 value={ticketData.message}
-                                onChange={(e) => setTicketData({ ...ticketData, message: e.target.value })}
-                            ></textarea>
+                                onChange={(e) => setTicketData({ ...ticketData, message: e.target.value })}></textarea>
                         </div>
-                        <button
-                            type="submit"
-                            className="bg-brand text-white font-semibold py-3 rounded-xl hover:bg-brand-hover mt-2"
-                        >Submit Ticket</button>
+                        <button type="submit" className="bg-brand text-white font-semibold py-3 rounded-xl hover:bg-brand-hover mt-2">
+                            Submit Ticket
+                        </button>
                     </form>
+                </Modal>
+
+                {/* ============ Ticket thread modal (SRS FR-46) ============ */}
+                <Modal
+                    isOpen={!!openTicketId}
+                    onClose={() => { setOpenTicketId(null); setTicketThread(null); }}
+                    title={ticketThread
+                        ? `#${ticketThread.ticket.id} — ${ticketThread.ticket.subject}`
+                        : 'Loading…'}
+                    maxWidth="max-w-2xl"
+                >
+                    {ticketLoading && (
+                        <div className="flex justify-center py-8">
+                            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-brand"></div>
+                        </div>
+                    )}
+
+                    {ticketThread && !ticketLoading && (
+                        <div className="flex flex-col gap-4">
+                            {/* Status line */}
+                            <div className="flex items-center justify-between text-xs text-muted">
+                                <span>Opened {ticketThread.ticket.created_at}</span>
+                                <TicketStatusBadge
+                                    status={ticketThread.ticket.status}
+                                    label={ticketThread.ticket.status_display}
+                                />
+                            </div>
+
+                            {/* Thread scroll area */}
+                            <div className="flex flex-col gap-3 max-h-[400px] overflow-y-auto pr-1">
+                                {/* Original customer message */}
+                                <div className="bg-gray-50 rounded-xl p-3">
+                                    <div className="flex justify-between mb-1">
+                                        <span className="text-xs font-bold text-navy">You</span>
+                                        <span className="text-[10px] text-muted">{ticketThread.ticket.created_at}</span>
+                                    </div>
+                                    <p className="text-sm text-text whitespace-pre-wrap">{ticketThread.ticket.message}</p>
+                                </div>
+
+                                {/* Replies in chronological order */}
+                                {ticketThread.replies.map((r) => (
+                                    <div key={r.id}
+                                        className={`rounded-xl p-3 ${
+                                            r.is_staff_reply
+                                                ? 'bg-brand-light border-l-4 border-brand'
+                                                : 'bg-gray-50'
+                                        }`}>
+                                        <div className="flex justify-between mb-1">
+                                            <span className={`text-xs font-bold ${r.is_staff_reply ? 'text-brand' : 'text-navy'}`}>
+                                                {r.author_name}
+                                            </span>
+                                            <span className="text-[10px] text-muted">{r.created_at}</span>
+                                        </div>
+                                        <p className="text-sm text-text whitespace-pre-wrap">{r.message}</p>
+                                    </div>
+                                ))}
+                            </div>
+
+                            {/* Reply form or closed notice */}
+                            {ticketThread.ticket.status !== 'closed' ? (
+                                <form onSubmit={handleSendReply} className="flex flex-col gap-2 border-t pt-3">
+                                    <textarea
+                                        rows="3"
+                                        required
+                                        placeholder="Write your reply…"
+                                        className="w-full border border-border rounded-lg p-3 text-sm focus:outline-none focus:border-brand"
+                                        value={replyMessage}
+                                        onChange={(e) => setReplyMessage(e.target.value)}
+                                    />
+                                    <button
+                                        type="submit"
+                                        disabled={sendingReply}
+                                        className="bg-brand text-white font-semibold py-2.5 rounded-xl hover:bg-brand-hover disabled:opacity-50"
+                                    >
+                                        {sendingReply ? 'Sending…' : 'Send Reply'}
+                                    </button>
+                                </form>
+                            ) : (
+                                <p className="text-xs text-muted text-center border-t pt-3">
+                                    This ticket is closed. Open a new ticket if you need more help.
+                                </p>
+                            )}
+                        </div>
+                    )}
                 </Modal>
             </div>
         );

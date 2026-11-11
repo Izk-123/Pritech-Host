@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<body style="font-family: Arial, sans-serif; background:#F7FAFD; padding:20px; margin:0;">
+  <div style="max-width:600px; margin:0 auto; background:#fff; border-radius:12px; overflow:hidden; border:1px solid #E1EAF2;">
+    <div style="background:#B45309; padding:20px; text-align:center;">
+      <h1 style="color:#fff; margin:0; font-size:22px;">Customer Replied</h1>
+    </div>
+    <div style="padding:30px;">
+      <h2 style="color:#16365F; margin-top:0;">Ticket #{{ ticket_id }} — {{ ticket_subject }}</h2>
+
+      <p style="color:#5B6B7C; font-size:16px; line-height:1.5;">
+        <strong>{{ customer_name }}</strong> ({{ customer_email }}) just replied:
+      </p>
+
+      <div style="background:#FEF3C7; border-left:4px solid #B45309; padding:16px; margin:20px 0; border-radius:8px;">
+        <p style="color:#16365F; font-size:15px; line-height:1.6; white-space:pre-wrap; margin:0;">{{ reply_message }}</p>
+      </div>
+
+      <div style="text-align:center; margin-top:25px;">
+        <a href="{{ admin_url }}" style="background:#16365F; color:#fff; padding:12px 28px; border-radius:8px; font-weight:bold; text-decoration:none; display:inline-block;">
+          Open Ticket in Admin
+        </a>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
