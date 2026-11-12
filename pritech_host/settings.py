@@ -218,6 +218,7 @@ TEMPLATES = [
                 'django.contrib.messages.context_processors.messages',
                 'core.context_processors.site_settings',
                 'core.context_processors.legal_documents',
+                'core.context_processors.social_providers',
             ],
         },
     },

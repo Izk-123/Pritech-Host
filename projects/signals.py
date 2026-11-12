@@ -1,23 +1,44 @@
-from django.db.models.signals import pre_save, post_save
-from django.dispatch import receiver
-from django.utils import timezone
-from datetime import timedelta
-from decimal import Decimal
+"""
+Project signals — milestone instalment issuance (FR-88) and stage
+transition bookkeeping (FR-94).
+
+The old (pre-v1.5) approach hard-coded 37.5% invoices at 'approval' and
+'launch' stages. Now the schedule is data on the plan, and this signal
+simply *triggers* the appropriate instalments when the project reaches
+the matching stage.
+
+Auto-advancement (FR-94) lives in billing.services.instalments —
+paying an instalment advances the project to the next stage.
+"""
 import logging
 
+from django.db.models.signals import pre_save, post_save
+from django.dispatch import receiver
+
 from .models import Project
-from billing.models import Invoice
-from core.services.email_utils import send_new_invoice_notification
 
 logger = logging.getLogger(__name__)
 
+
+# Trigger mapping: when the project enters this stage, issue these
+# instalment triggers.
+STAGE_TO_TRIGGER = {
+    'content':  'content',
+    'approval': 'design_approval',
+    'launch':   'launch',
+}
+
+
 @receiver(pre_save, sender=Project)
-def track_old_stage(sender, instance, **kwargs):
-    """Captures the stage before saving to detect changes."""
+def _capture_old_stage(sender, instance, **kwargs):
+    """
+    Snapshot the previous stage before saving so the post_save receiver
+    can detect transitions. On create, `_old_stage` is set to None so
+    the post_save handler can skip the newly-created case.
+    """
     if instance.pk:
         try:
-            old_instance = Project.objects.get(pk=instance.pk)
-            instance._old_stage = old_instance.stage
+            instance._old_stage = Project.objects.get(pk=instance.pk).stage
         except Project.DoesNotExist:
             instance._old_stage = None
     else:
@@ -25,46 +46,43 @@ def track_old_stage(sender, instance, **kwargs):
 
 
 @receiver(post_save, sender=Project)
-def generate_milestone_invoices(sender, instance, created, **kwargs):
+def _issue_milestone_instalments(sender, instance, created, **kwargs):
     """
-    Automatically generates invoices and sends notifications 
-    when the project stage advances to Approval or Launch.
-    SRS FR-64: Balance is due at design approval and launch.
+    FR-88: issue milestone instalments when the project reaches a
+    milestone stage.
+
+    Idempotent — `issue_milestone_instalments()` in billing.services
+    only acts on `scheduled` instalments for the matching trigger, so
+    re-saving the same stage (or a stage we don't have a trigger for)
+    is a no-op.
     """
-    if created or not getattr(instance, 'total_price_mwk', None):
+    if created:
         return
 
     old_stage = getattr(instance, '_old_stage', None)
     new_stage = instance.stage
 
-    # If the stage hasn't changed, do nothing
-    if old_stage == new_stage:
+    if not old_stage or old_stage == new_stage:
         return
 
-    # 37.5% balance for Design Approval
-    if new_stage == 'approval' and old_stage != 'approval':
-        amount = instance.total_price_mwk * Decimal('0.375')
-        invoice = Invoice.objects.create(
-            customer=instance.customer,
-            due_date=timezone.now().date() + timedelta(days=7),
-            subtotal_mwk=amount,
-            total_mwk=amount,
-            is_deposit=False
+    subscription = instance.subscription
+    if not subscription:
+        return
+
+    trigger = STAGE_TO_TRIGGER.get(new_stage)
+    if not trigger:
+        return
+
+    try:
+        from billing.services.instalments import issue_milestone_instalments
+        issued = issue_milestone_instalments(subscription, trigger)
+        if issued:
+            logger.info(
+                f"[PROJECT] Advanced to '{new_stage}' — issued "
+                f"{len(issued)} '{trigger}' instalment invoice(s) for sub {subscription.id}"
+            )
+    except Exception as exc:
+        logger.exception(
+            f"[PROJECT] Failed to issue '{trigger}' instalments for "
+            f"subscription {subscription.id} on stage '{new_stage}': {exc}"
         )
-        logger.info(f"Generated milestone invoice {invoice.invoice_number} for Approval stage.")
-        # Send Email Notification
-        send_new_invoice_notification(invoice)
-    
-    # 37.5% balance for Launch
-    elif new_stage == 'launch' and old_stage != 'launch':
-        amount = instance.total_price_mwk * Decimal('0.375')
-        invoice = Invoice.objects.create(
-            customer=instance.customer,
-            due_date=timezone.now().date() + timedelta(days=7),
-            subtotal_mwk=amount,
-            total_mwk=amount,
-            is_deposit=False
-        )
-        logger.info(f"Generated milestone invoice {invoice.invoice_number} for Launch stage.")
-        # Send Email Notification
-        send_new_invoice_notification(invoice)
