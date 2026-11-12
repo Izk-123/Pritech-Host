@@ -9,21 +9,18 @@ Sections
 4. Legal documents     — versioned legal pages + cookie consent API
 5. Ticket conversation — customer-facing threaded ticket APIs (SRS FR-46)
 
+Billing model (v1.5 / FR-85 to FR-95)
+-------------------------------------
+At checkout, instalments are created from `Plan.effective_schedule()`.
+The checkout-triggered instalment is issued as an invoice immediately;
+the rest are `scheduled` and become `issued` when the project reaches
+the matching milestone. The dashboard surfaces the full schedule
+(paid, issued, upcoming) with a per-instalment Pay button.
+
 Rate limiting (SRS NFR-11)
 --------------------------
-Sensitive state-changing endpoints are wrapped with @ratelimit so a
-compromised or malicious session can't:
-  - spam payment initiations (would create orphan Payment rows)
-  - create thousands of tickets
-  - flood the customer's own ticket thread
-  - hammer the cookie-consent audit log
-
-Limits are per-user (or per-IP for anonymous endpoints) and only apply
-when RATELIMIT_ENABLE=True (prod). Dev defaults to off.
-
-Login endpoints are NOT rate-limited here — django-axes handles
-brute-force protection on those with a separate mechanism (lockout
-after 5 failures vs. throttled throughput here).
+Sensitive state-changing endpoints are wrapped with @ratelimit. Applies
+only when RATELIMIT_ENABLE=True (prod). Dev default is off.
 """
 import hashlib
 import hmac
@@ -44,10 +41,9 @@ from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_exempt
 from django.views.generic import FormView, ListView, TemplateView, View
 
-# Rate limiting (SRS NFR-11)
 from django_ratelimit.decorators import ratelimit
 
-from billing.models import Invoice, Payment, Plan, Subscription
+from billing.models import Invoice, Payment, Plan, Subscription, SubscriptionInstalment
 from billing.services.invoice_pdf import generate_invoice_pdf
 from billing.services.paychangu import PayChanguService
 from billing.services.payments import (
@@ -55,6 +51,7 @@ from billing.services.payments import (
     has_recent_pending_payment,
     sync_pending_payments,
 )
+from billing.services.instalments import create_instalments_for_subscription
 from hosting.models import HostingAccount
 from hosting.services.hestia import HestiaCP
 from projects.models import Project
@@ -81,12 +78,10 @@ logger = logging.getLogger(__name__)
 # ==============================================================================
 
 def _human_period(plan: Plan) -> str:
-    """'monthly' → 'month', 'yearly' → 'year'."""
     return 'month' if plan.billing_period == 'monthly' else 'year'
 
 
 def _get_client_ip(request) -> str | None:
-    """Extract the real client IP behind Nginx (leftmost X-Forwarded-For)."""
     if request is None:
         return None
     x_forwarded = request.META.get('HTTP_X_FORWARDED_FOR')
@@ -96,7 +91,13 @@ def _get_client_ip(request) -> str | None:
 
 
 def _handle_renewal_payment(invoice: Invoice) -> None:
-    """Extend the linked subscription when a renewal invoice is paid."""
+    """
+    Extend the subscription end_date when a RENEWAL invoice is paid.
+
+    Instalments are untouched — they belong to the previous contract
+    and are already settled (or void). FR-91: renewals don't affect
+    the contract balance.
+    """
     if invoice.invoice_type != 'renewal' or not invoice.subscription_id:
         return
 
@@ -121,8 +122,7 @@ def _handle_renewal_payment(invoice: Invoice) -> None:
         logger.info(f"[RENEWAL] Unsuspended Hestia account for {sub.user.email}")
 
     logger.info(
-        f"[RENEWAL] Subscription {sub.id} renewed — "
-        f"new end_date={sub.end_date}."
+        f"[RENEWAL] Subscription {sub.id} renewed — new end_date={sub.end_date}."
     )
 
 
@@ -136,6 +136,30 @@ def _post_sync_renewals(user: User) -> None:
     for sub in pending:
         if sub.renewal_invoice.status == 'paid':
             _handle_renewal_payment(sub.renewal_invoice)
+
+
+def _checkout_amount_from_schedule(plan: Plan):
+    """
+    Derive the checkout-time amount from the first instalment in the
+    plan's effective schedule.
+
+    Returns (first_instalment_dict, amount_mwk, remaining_mwk,
+             period_label, is_fully_paid_at_checkout).
+    """
+    schedule = plan.effective_schedule()
+    first = schedule[0]
+    pct   = Decimal(str(first.get('pct', 0)))
+
+    amount    = (plan.price_mwk * pct / Decimal('100')).quantize(Decimal('0.01'))
+    remaining = plan.price_mwk - amount
+
+    return {
+        'first':      first,
+        'amount':     amount,
+        'remaining':  remaining,
+        'is_full':    remaining == 0,
+        'period':     'month' if plan.is_monthly else 'year',
+    }
 
 
 # ==============================================================================
@@ -153,7 +177,14 @@ class HomeView(ListView):
 
 
 class CheckoutView(FormView):
-    """SRS FR-15, FR-63, FR-64 — Checkout flow."""
+    """
+    SRS FR-15, FR-63, FR-64, FR-85 — Checkout flow.
+
+    Creates the subscription with a snapshot of the plan's payment
+    schedule, then issues only the checkout-triggered instalment.
+    Remaining instalments live as `scheduled` rows and become `issued`
+    when the project reaches their trigger stage.
+    """
     template_name = 'core/checkout.html'
     form_class = CheckoutForm
 
@@ -169,18 +200,38 @@ class CheckoutView(FormView):
         return kwargs
 
     def get_context_data(self, **kwargs):
+        """
+        Compute the checkout card copy from the plan's *first instalment*,
+        not from a hardcoded 25%/100% split.
+        """
         context = super().get_context_data(**kwargs)
-        deposit_amount = self.plan.price_mwk * Decimal('0.25')
-        context['plan']           = self.plan
-        context['deposit_amount'] = deposit_amount
-        context['balance_amount'] = self.plan.price_mwk - deposit_amount
-        context['billing_period'] = _human_period(self.plan)
+        context['plan'] = self.plan
+
+        sched = _checkout_amount_from_schedule(self.plan)
+
+        context.update({
+            'is_monthly':           self.plan.is_monthly,
+            'billing_period':       self.plan.billing_period,
+            'billing_period_label': sched['period'],
+            'checkout_amount':      sched['amount'],
+            'balance_amount':       sched['remaining'],
+            'checkout_label':       (
+                f"Pay today ({sched['first']['label']})"
+                if sched['is_full']
+                else f"{sched['first']['label']} ({int(sched['first']['pct'])}%)"
+            ),
+            'balance_label':        (
+                None if sched['is_full'] else "Remaining at milestones"
+            ),
+            'deposit_amount':       sched['amount'],  # legacy template compat
+        })
         return context
 
     @transaction.atomic
     def form_valid(self, form):
         cleaned = form.cleaned_data
 
+        # --- Step 1: resolve / create the customer ------------------------
         if self.request.user.is_authenticated:
             user = self.request.user
             user.phone_number  = user.phone_number  or cleaned.get('phone_number')
@@ -212,26 +263,38 @@ class CheckoutView(FormView):
                 backend='django.contrib.auth.backends.ModelBackend',
             )
 
+        # --- Step 2: subscription + project -------------------------------
+        contract_total = self.plan.price_mwk
         end_date = timezone.now().date() + timedelta(days=self.plan.period_days)
+
         subscription = Subscription.objects.create(
-            user=user, plan=self.plan, end_date=end_date,
+            user=user,
+            plan=self.plan,
+            end_date=end_date,
+            total_contract_mwk=contract_total,
+            payment_schedule=self.plan.effective_schedule(),
         )
 
         Project.objects.create(
-            customer=user, subscription=subscription,
-            requested_domain=cleaned.get('requested_domain', ''),
-            total_price_mwk=self.plan.price_mwk, stage='deposit',
-        )
-
-        deposit_amount = self.plan.price_mwk * Decimal('0.25')
-        invoice = Invoice.objects.create(
-            customer=user, due_date=timezone.now().date(),
-            subtotal_mwk=deposit_amount, total_mwk=deposit_amount,
-            is_deposit=True, invoice_type='deposit',
+            customer=user,
             subscription=subscription,
+            requested_domain=cleaned.get('requested_domain', ''),
+            total_price_mwk=contract_total,
+            stage='deposit',
         )
 
-        # Record legal acceptance
+        # --- Step 3: create instalments, issue checkout-triggered one -----
+        first_instalment = create_instalments_for_subscription(subscription)
+
+        if not first_instalment or not first_instalment.invoice:
+            messages.error(
+                self.request,
+                "There was a problem creating your payment schedule. "
+                "Please contact support.",
+            )
+            return self.form_invalid(form)
+
+        # --- Step 4: record legal acceptance ------------------------------
         client_ip  = _get_client_ip(self.request)
         user_agent = self.request.META.get('HTTP_USER_AGENT', '')[:1000]
 
@@ -244,7 +307,8 @@ class CheckoutView(FormView):
                     content_hash=doc.content_hash(),
                 )
 
-        checkout_url = PayChanguService.initiate_payment(invoice)
+        # --- Step 5: redirect to PayChangu for the first instalment -------
+        checkout_url = PayChanguService.initiate_payment(first_instalment.invoice)
         if checkout_url:
             return redirect(checkout_url)
 
@@ -273,7 +337,14 @@ class DashboardView(LoginRequiredMixin, TemplateView):
 
 
 class DashboardAPIView(LoginRequiredMixin, View):
-    """Single JSON feed powering the React dashboard."""
+    """
+    Single JSON feed powering the React dashboard.
+
+    The `balance` block (yearly schedules) exposes:
+        contract_total / amount_paid / remaining / paid_pct / is_fully_paid
+        next_instalment  — the current one to highlight
+        upcoming_instalments — the full schedule for the list UI
+    """
     def get(self, request, *args, **kwargs):
         user = request.user
         site = SiteSettings.load()
@@ -281,10 +352,12 @@ class DashboardAPIView(LoginRequiredMixin, View):
         sync_pending_payments(user)
         _post_sync_renewals(user)
 
+        # --- Related rows --------------------------------------------------
         subscription    = Subscription.objects.filter(user=user, is_active=True).first()
         hosting_account = HostingAccount.objects.filter(user=user).first()
         project         = Project.objects.filter(customer=user).order_by('-id').first()
 
+        # --- Hosting status ladder -----------------------------------------
         if hosting_account and hosting_account.is_active:
             hosting_status  = 'active'
             hestia_username = hosting_account.hestia_username
@@ -295,6 +368,7 @@ class DashboardAPIView(LoginRequiredMixin, View):
             hosting_status  = 'pending'
             hestia_username = None
 
+        # --- Usage ---------------------------------------------------------
         usage = {
             'disk_used': 0, 'disk_limit': 0, 'disk_pct': 0,
             'bw_used':   0, 'bw_limit':   0, 'bw_pct':   0,
@@ -309,6 +383,7 @@ class DashboardAPIView(LoginRequiredMixin, View):
             if usage['bw_limit']:
                 usage['bw_pct']   = min(100, int(usage['bw_used']   / usage['bw_limit']   * 100))
 
+        # --- Invoice slices ------------------------------------------------
         invoices     = Invoice.objects.filter(customer=user).order_by('-issue_date')[:5]
         next_invoice = (
             Invoice.objects
@@ -317,17 +392,16 @@ class DashboardAPIView(LoginRequiredMixin, View):
             .first()
         )
 
+        # --- Tickets -------------------------------------------------------
         tickets = (
             Ticket.objects
             .filter(user=user)
             .prefetch_related('replies')
             .order_by('-updated_at')[:10]
         )
-
         open_tickets_count = Ticket.objects.filter(
             user=user, status__in=('open', 'awaiting_customer'),
         ).count()
-
         unread_replies_total = TicketReply.objects.filter(
             ticket__user=user, is_staff_reply=True, read_by_customer=False,
         ).count()
@@ -346,6 +420,7 @@ class DashboardAPIView(LoginRequiredMixin, View):
             } for t in tickets
         ]
 
+        # --- Renewal context ----------------------------------------------
         renewal_info = None
         if subscription:
             renewal_info = {
@@ -368,8 +443,64 @@ class DashboardAPIView(LoginRequiredMixin, View):
                 ),
             }
 
+        # --- Balance context (FR-89) --------------------------------------
+        # Populated whenever the subscription has instalments (any plan).
+        # The template decides whether to show the card or a small badge.
+        balance_info        = None
+        upcoming_instalments = []
+        if subscription:
+            instalments_qs = subscription.instalments.order_by('sequence')
+
+            if instalments_qs.exists():
+                current = (
+                    instalments_qs
+                    .filter(status__in=['issued', 'scheduled'])
+                    .order_by('sequence')
+                    .first()
+                )
+
+                balance_info = {
+                    'contract_total': float(subscription.contract_total_mwk),
+                    'amount_paid':    float(subscription.total_paid_mwk),
+                    'remaining':      float(subscription.remaining_balance_mwk),
+                    'paid_pct':       subscription.paid_pct,
+                    'is_fully_paid':  subscription.is_fully_paid,
+                    'next_instalment': {
+                        'sequence':   current.sequence,
+                        'label':      current.label,
+                        'amount':     float(current.amount_mwk),
+                        'trigger':    current.trigger,
+                        'status':     current.status,
+                        'invoice_id': current.invoice.id if current.invoice else None,
+                        'due_date':   (
+                            current.due_date.strftime('%d %b %Y')
+                            if current.due_date else None
+                        ),
+                    } if current else None,
+                }
+
+                upcoming_instalments = [
+                    {
+                        'sequence':   i.sequence,
+                        'label':      i.label,
+                        'amount':     float(i.amount_mwk),
+                        'percentage': float(i.percentage),
+                        'trigger':    i.trigger,
+                        'status':     i.status,
+                        'invoice_id': i.invoice.id if i.invoice else None,
+                        'due_date':   (
+                            i.due_date.strftime('%d %b %Y')
+                            if i.due_date else None
+                        ),
+                        'issued':     i.status in ('issued', 'paid'),
+                    }
+                    for i in instalments_qs
+                ]
+
+        # --- Response ------------------------------------------------------
         return JsonResponse({
             'user_name': user.first_name or 'Customer',
+
             'site': {
                 'name':          site.site_name,
                 'cpanel_url':    site.cpanel_url,
@@ -377,6 +508,7 @@ class DashboardAPIView(LoginRequiredMixin, View):
                 'contact_email': site.contact_email,
                 'contact_phone': site.contact_phone,
             },
+
             'subscription': {
                 'plan_name':       subscription.plan.name,
                 'price':           float(subscription.plan.price_mwk),
@@ -387,10 +519,15 @@ class DashboardAPIView(LoginRequiredMixin, View):
                 'email_limit':     subscription.plan.email_accounts,
                 'ssh_access':      subscription.plan.ssh_access,
             } if subscription else None,
-            'renewal': renewal_info,
+
+            'renewal':              renewal_info,
+            'balance':              balance_info,
+            'upcoming_instalments': upcoming_instalments,
+
             'hosting_status':  hosting_status,
             'hestia_username': hestia_username,
             'usage':           usage,
+
             'invoices': [
                 {
                     'id':     inv.id,
@@ -398,20 +535,25 @@ class DashboardAPIView(LoginRequiredMixin, View):
                     'date':   inv.issue_date.strftime('%d %b %Y'),
                     'amount': float(inv.total_mwk),
                     'status': inv.status.upper(),
+                    'type':   inv.invoice_type,
                 } for inv in invoices
             ],
+
             'next_invoice': {
                 'id':       next_invoice.id,
                 'number':   next_invoice.invoice_number,
                 'amount':   float(next_invoice.total_mwk),
                 'due_date': next_invoice.due_date.strftime('%d %b %Y'),
+                'type':     next_invoice.invoice_type,
             } if next_invoice else None,
+
             'project': {
                 'stage':         project.stage,
                 'stage_display': project.get_stage_display(),
                 'domain':        project.requested_domain,
                 'total_price':   float(project.total_price_mwk),
             } if project else None,
+
             'tickets':              tickets_payload,
             'open_tickets_count':   open_tickets_count,
             'unread_replies_total': unread_replies_total,
@@ -425,8 +567,6 @@ class ProfileView(LoginRequiredMixin, TemplateView):
 
 
 @method_decorator(
-    # 30 profile updates per hour per user — covers batch-editing via
-    # the dashboard without blocking normal use.
     ratelimit(key='user', rate='30/h', method='POST', block=True),
     name='dispatch',
 )
@@ -475,9 +615,6 @@ class ProfileAPIView(LoginRequiredMixin, View):
 
 
 @method_decorator(
-    # 10 payment initiations per hour per user. Legitimate customers pay
-    # 1–3 invoices per visit; 10/h is very generous and blocks anyone
-    # using the account as a card-testing or spam gateway.
     ratelimit(key='user', rate='10/h', method='POST', block=True),
     name='dispatch',
 )
@@ -485,7 +622,9 @@ class PayInvoiceAPIView(LoginRequiredMixin, View):
     """Kick off PayChangu for an unpaid invoice (dashboard 'Pay now')."""
     def post(self, request, *args, **kwargs):
         data = json.loads(request.body)
-        invoice = get_object_or_404(Invoice, id=data.get('invoice_id'), customer=request.user)
+        invoice = get_object_or_404(
+            Invoice, id=data.get('invoice_id'), customer=request.user,
+        )
         if invoice.status == 'paid':
             return JsonResponse({'error': 'Invoice already paid'}, status=400)
 
@@ -496,9 +635,6 @@ class PayInvoiceAPIView(LoginRequiredMixin, View):
 
 
 @method_decorator(
-    # 5 new tickets per hour per user. A real customer opening 6 tickets
-    # in one hour is far more likely a bot or an angry spammer than a
-    # genuine need.
     ratelimit(key='user', rate='5/h', method='POST', block=True),
     name='dispatch',
 )
@@ -641,10 +777,6 @@ class LegalDocumentView(TemplateView):
 
 
 @method_decorator(
-    # 5 cookie-consent submissions per minute per IP. The banner should
-    # fire once per session; a flood means someone is hammering the
-    # audit table (or a JS bug is re-firing). 5/min gives room for
-    # editing preferences without opening a DoS vector.
     ratelimit(key='ip', rate='5/m', method='POST', block=True),
     name='dispatch',
 )
@@ -683,10 +815,7 @@ class CookieConsentAPIView(View):
 # ==============================================================================
 
 class TicketDetailAPIView(LoginRequiredMixin, View):
-    """
-    Return a ticket with its full reply thread. Marks staff replies as
-    read by the customer.
-    """
+    """Return a ticket with its full reply thread. Marks replies read."""
     def get(self, request, ticket_id, *args, **kwargs):
         try:
             ticket = Ticket.objects.get(id=ticket_id, user=request.user)
@@ -729,8 +858,6 @@ class TicketDetailAPIView(LoginRequiredMixin, View):
 
 
 @method_decorator(
-    # 30 replies per hour per user — high enough for a normal back-and-forth
-    # with support, low enough that a bot can't flood the thread.
     ratelimit(key='user', rate='30/h', method='POST', block=True),
     name='dispatch',
 )

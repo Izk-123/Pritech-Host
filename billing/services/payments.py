@@ -1,10 +1,19 @@
-# billing/services/payments.py
 """
-One place that turns a verified PayChangu payment into a paid invoice.
+Turns a verified PayChangu payment into a paid invoice.
 
 The webhook, the browser callback and the dashboard all call
-finalize_invoice_payment(). It is idempotent, so whichever runs first wins
-and the others do nothing. Nothing depends on the webhook alone any more.
+finalize_invoice_payment(). It is idempotent, so whichever runs first
+wins and the others do nothing.
+
+Follow-ups (post-commit, so a slow Celery task can't roll back the
+payment):
+    • Mark the linked SubscriptionInstalment as paid (FR-89)
+    • Fire the receipt email (defensively — a broken SMTP server must
+      not turn a successful payment into a 500)
+    • Provision Hestia on the first instalment (is_deposit=True)
+
+Renewal invoices skip the instalment step — they're tracked separately
+per FR-91.
 """
 import logging
 from datetime import timedelta
@@ -18,7 +27,7 @@ from billing.services.paychangu import PayChanguService
 
 logger = logging.getLogger(__name__)
 
-# How long a started payment attempt is worth checking with PayChangu.
+# How long a started payment attempt is worth re-checking with PayChangu.
 PENDING_WINDOW = timedelta(minutes=45)
 
 
@@ -36,40 +45,73 @@ def _method_from(data):
 
 
 def _queue_follow_ups(invoice_id):
-    """Receipt email, and provisioning for deposit invoices (async via Celery)."""
+    """
+    Post-commit follow-ups triggered by a successful payment:
+
+        1. Mark the linked SubscriptionInstalment as paid (idempotent).
+        2. Send the receipt email (defensively).
+        3. Provision Hestia — only for the first instalment (is_deposit).
+    """
     from core.tasks import send_transactional_email_task
     from hosting.tasks import provision_hosting_account_task
+    from billing.services.instalments import mark_instalment_paid
 
-    invoice = Invoice.objects.select_related('customer').get(id=invoice_id)
-    send_transactional_email_task.delay(
-        subject=f"Payment Received - {invoice.invoice_number}",
-        template_name='payment_confirmed',
-        context={
-            'customer_name': invoice.customer.first_name,
-            'invoice_number': invoice.invoice_number,
-            'amount': invoice.total_mwk,
-            'dashboard_url': "https://pritechhost.com/dashboard/",
-        },
-        to_email=invoice.customer.email,
-    )
+    invoice = Invoice.objects.select_related('customer', 'subscription').get(id=invoice_id)
+
+    # 1. Instalment settlement (drives balance + dashboard + project stage)
+    if invoice.invoice_type == 'instalment':
+        try:
+            mark_instalment_paid(invoice)
+        except Exception as exc:
+            # Very unlikely (would mean the DB is inconsistent), but log
+            # so we can investigate without losing the receipt.
+            logger.exception(f"[PAYMENT] Instalment settlement failed for {invoice.invoice_number}: {exc}")
+
+    # 2. Receipt email — defensive. A broken mail server must not
+    # turn a successful payment into a 500 for the customer.
+    try:
+        send_transactional_email_task.delay(
+            subject=f"Payment Received - {invoice.invoice_number}",
+            template_name='payment_confirmed',
+            context={
+                'customer_name': invoice.customer.first_name,
+                'invoice_number': invoice.invoice_number,
+                'amount': invoice.total_mwk,
+                'dashboard_url': "https://pritechhost.com/dashboard/",
+            },
+            to_email=invoice.customer.email,
+        )
+    except Exception as exc:
+        logger.warning(
+            f"[PAYMENT] Could not queue receipt email for {invoice.invoice_number}: {exc}. "
+            f"Payment is still recorded."
+        )
+
+    # 3. Provisioning only on the very first instalment.
     if invoice.is_deposit:
-        provision_hosting_account_task.delay(invoice.id)
+        try:
+            provision_hosting_account_task.delay(invoice.id)
+        except Exception as exc:
+            logger.warning(
+                f"[PAYMENT] Could not queue provisioning for {invoice.invoice_number}: {exc}. "
+                f"Run provisioning manually or re-trigger from admin."
+            )
 
 
 def finalize_invoice_payment(tx_ref):
     """
-    Verify tx_ref with PayChangu and, if it was paid in full, mark its invoice
+    Verify tx_ref with PayChangu and, if paid in full, mark its invoice
     paid and record the payment.
 
-    Returns (invoice, newly_paid). (None, False) means the payment could not
-    be confirmed (not paid yet, failed, or unknown reference).
+    Returns (invoice, newly_paid). (None, False) means the payment could
+    not be confirmed (not paid yet, failed, or unknown reference).
     """
     invoice_id = PayChanguService.invoice_id_from_ref(tx_ref)
     if invoice_id is None:
         logger.error("Payments: unrecognised reference %r", tx_ref)
         return None, False
 
-    # Network call first, outside the database lock.
+    # Network call first, outside the DB lock.
     data = PayChanguService.verify_payment(tx_ref)
     if data is None:
         return None, False
@@ -82,7 +124,7 @@ def finalize_invoice_payment(tx_ref):
             return None, False
 
         if invoice.status == 'paid':
-            return invoice, False  # someone else already settled it
+            return invoice, False   # idempotent — another path already settled
 
         paid = Decimal(str(data.get('amount') or 0))
         if data.get('currency', 'MWK') != 'MWK' or paid < invoice.total_mwk:
@@ -110,6 +152,7 @@ def finalize_invoice_payment(tx_ref):
                 payment_method=_method_from(data),
             )
 
+        # Post-commit so a Celery hiccup can't roll back the payment.
         transaction.on_commit(lambda: _queue_follow_ups(invoice.id))
 
     logger.info("Payments: %s marked PAID via %s.", invoice.invoice_number, tx_ref)
@@ -127,8 +170,7 @@ def _recent_pending(user):
 
 
 def sync_pending_payments(user):
-    """Settle recent attempts the webhook has not confirmed (yet).
-    Called whenever the dashboard loads."""
+    """Settle recent attempts the webhook has not confirmed (yet)."""
     changed = False
     for ref in list(_recent_pending(user).values_list('gateway_reference', flat=True)[:3]):
         _, newly_paid = finalize_invoice_payment(ref)

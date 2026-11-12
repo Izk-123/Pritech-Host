@@ -5,7 +5,7 @@ Registered in ``TEMPLATES[0]['OPTIONS']['context_processors']`` in
 settings.py so that every template automatically has these variables
 in scope.
 
-Two independent processors, one concern each:
+Three independent processors, one concern each:
 
     site_settings    — SiteSettings singleton (hero copy, contact info,
                        support hours, cPanel URL, footer tagline).
@@ -14,6 +14,12 @@ Two independent processors, one concern each:
                        (Terms, Privacy, AUP, Refund), exposed so the
                        footer, checkout, and signup pages can link to
                        real versioned URLs instead of hardcoded paths.
+
+    social_providers — Boolean flags describing which social-login
+                       providers are actually configured. Templates
+                       use these to guard ``{% provider_login_url %}``
+                       tags, which raise ``MultipleObjectsReturned`` or
+                       ``SocialApp.DoesNotExist`` when misconfigured.
 
 Performance notes
 -----------------
@@ -26,6 +32,8 @@ Performance notes
   we batch the four lookups into a single cache entry with a 60-second
   TTL. That trades at most 60 s of staleness after an admin edit for a
   large reduction in query load on the LegalDocument table.
+
+* ``social_providers()`` is a pure settings lookup — no DB, no cache.
 """
 
 from django.core.cache import cache
@@ -119,3 +127,57 @@ def legal_documents(request):
 
     cache.set(LEGAL_DOCS_CACHE_KEY, payload, LEGAL_DOCS_CACHE_TTL)
     return payload
+
+
+# =============================================================================
+# Social-login provider flags
+# =============================================================================
+
+def social_providers(request):
+    """
+    Inject boolean flags describing which social-login providers are
+    configured, so templates can safely guard their provider buttons.
+
+    Template variables exposed:
+
+        google_sso_enabled : bool
+
+    Why this matters
+    ----------------
+    allauth's ``{% provider_login_url 'google' %}`` template tag does a
+    lookup that raises an exception when Google isn't fully configured:
+
+        * ``MultipleObjectsReturned`` — if there are 2+ SocialApp rows
+          for Google in the database (the exact bug we just fixed).
+
+        * ``SocialApp.DoesNotExist``  — if there are 0 rows *and* the
+          settings-level ``SOCIALACCOUNT_PROVIDERS['google']['APP']``
+          has no ``client_id`` / ``secret``.
+
+        * ``ImproperlyConfigured``    — if ``allauth.socialaccount``
+          isn't in INSTALLED_APPS but the tag is called anyway.
+
+    Any of these crashes the whole page render — not just the button.
+    A blank ``GOOGLE_CLIENT_ID`` in a future deploy would 500 every
+    checkout and signup page for every customer.
+
+    Guarding the tag with ``{% if google_sso_enabled %}`` means the tag
+    is never evaluated when it would raise, so the page renders cleanly
+    without the button. When credentials are present, the flag is True
+    and the button renders normally.
+
+    The check itself is a pure settings lookup — no DB query, no cache.
+    """
+    from django.conf import settings
+
+    app_cfg = (
+        settings.SOCIALACCOUNT_PROVIDERS
+        .get('google', {})
+        .get('APP', {})
+    )
+
+    return {
+        'google_sso_enabled': bool(
+            app_cfg.get('client_id') and app_cfg.get('secret')
+        ),
+    }
