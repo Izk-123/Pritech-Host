@@ -4,15 +4,20 @@
 
 {% block react_code %}
 
-<!-- =============================================================
-     1. Globals — auth status, user data, site content, plan data
-     ============================================================= -->
+<!-- ==================================================================
+     Globals — Django template variables → window.* JS
+
+     IMPORTANT: Everything in this <script> block runs OUTSIDE any
+     verbatim block. That means Django's template engine will process
+     template variables and template tags normally.
+     ================================================================== -->
 <script>
     window.PRITECH_LOGO_URL = "{% static 'images/pritech-logo.svg' %}";
     window.CSRF_TOKEN       = "{{ csrf_token }}";
 
     window.IS_AUTHENTICATED = {% if request.user.is_authenticated %}true{% else %}false{% endif %};
 
+    // Pre-fill values for logged-in users. For guests these resolve to ''.
     window.USER_DATA = {
         email:         "{{ request.user.email|default:''|escapejs }}",
         first_name:    "{{ request.user.first_name|default:''|escapejs }}",
@@ -22,58 +27,97 @@
         gender:        "{{ request.user.gender|default:''|escapejs }}"
     };
 
-    window.GOOGLE_LOGIN_URL = "{% provider_login_url 'google' next=request.path %}";
+    // Google SSO is only wired up when the backend confirms it's
+    // configured. Otherwise, calling the login-URL helper would raise
+    // MultipleObjectsReturned / DoesNotExist and 500 the page.
+    {% if google_sso_enabled %}
+        window.GOOGLE_LOGIN_URL = "{% provider_login_url 'google' next=request.path %}";
+    {% else %}
+        window.GOOGLE_LOGIN_URL = "";
+    {% endif %}
 
+    // Site-wide content (SiteSettings via context processor).
     window.SITE = {
         name:  "{{ site.site_name|escapejs }}",
         email: "{{ site.contact_email|escapejs }}",
         phone: "{{ site.contact_phone|escapejs }}"
     };
 
-    window.PLAN_BILLING_PERIOD = "{{ billing_period|default:'year'|escapejs }}";
+    // Billing model (v1.5)
+    //   monthly → 100% upfront
+    //   yearly  → 25% deposit now + 75% balance auto-invoiced after
+    window.IS_MONTHLY           = {{ is_monthly|yesno:"true,false" }};
+    window.CHECKOUT_AMOUNT      = {{ checkout_amount }};
+    window.BALANCE_AMOUNT       = {{ balance_amount }};
+    window.CHECKOUT_LABEL       = "{{ checkout_label|escapejs }}";
+    window.BALANCE_LABEL        = "{{ balance_label|default:''|escapejs }}";
+    window.BILLING_PERIOD_LABEL = "{{ billing_period_label|default:'year'|escapejs }}";
 
+    // Django `messages` framework output.
     window.DJANGO_MESSAGES = [
         {% for message in messages %}
         { "tags": "{{ message.tags }}", "message": "{{ message|escapejs }}" }{% if not forloop.last %},{% endif %}
         {% endfor %}
     ];
+
+    // Server-side form errors from a failed POST.
     window.FORM_ERRORS = {{ form.errors.as_json|safe|default:"{}" }};
 </script>
 
+<!-- JSON transport for numeric values. These emit application/json
+     script tags so we don't have to format or escape decimals in
+     template output. -->
 {{ plan.name|json_script:"plan-name" }}
 {{ plan.price_mwk|json_script:"plan-price" }}
-{{ deposit_amount|json_script:"deposit-amount" }}
+{{ checkout_amount|json_script:"checkout-amount" }}
 {{ balance_amount|json_script:"balance-amount" }}
 
+<!-- ==================================================================
+     React code — wrapped in verbatim so Django does NOT try to parse
+     JSX curly braces and template-looking syntax.
+     ================================================================== -->
 {% verbatim %}
 <script type="text/babel">
-    const hasMotion      = !!window.Motion;
-    const motion         = hasMotion ? window.Motion.motion : { div: (props) => <div {...props} /> };
+    const hasMotion       = !!window.Motion;
+    const motion          = hasMotion ? window.Motion.motion : { div: (props) => <div {...props} /> };
     const AnimatePresence = hasMotion ? window.Motion.AnimatePresence : ({ children }) => <>{children}</>;
 
     function safeJson(id, fallback) {
         try {
             const el = document.getElementById(id);
-            return el ? JSON.parse(el.textContent) : fallback;
-        } catch (e) { return fallback; }
+            if (!el) return fallback;
+            const text = (el.textContent || '').trim();
+            if (!text) return fallback;
+            return JSON.parse(text);
+        } catch (e) {
+            console.error('Failed to parse JSON for', id, e);
+            return fallback;
+        }
     }
 
-    const planName      = safeJson('plan-name', 'Package');
-    const planPrice     = parseFloat(safeJson('plan-price', 0)) || 0;
-    const depositAmount = parseFloat(safeJson('deposit-amount', 0)) || 0;
-    const balanceAmount = parseFloat(safeJson('balance-amount', 0)) || 0;
+    // ---------- Parsed values -------------------------------------------
+    const planName       = safeJson('plan-name', 'Package');
+    const planPrice      = parseFloat(safeJson('plan-price', 0)) || 0;
+    const checkoutAmount = parseFloat(safeJson('checkout-amount', 0)) || 0;
+    const balanceAmount  = parseFloat(safeJson('balance-amount', 0)) || 0;
 
+    // ---------- Globals --------------------------------------------------
     const LOGO_URL         = window.PRITECH_LOGO_URL;
     const CSRF_TOKEN       = window.CSRF_TOKEN;
     const IS_AUTHENTICATED = window.IS_AUTHENTICATED;
     const USER_DATA        = window.USER_DATA || {};
-    const GOOGLE_LOGIN_URL = window.GOOGLE_LOGIN_URL;
+    const GOOGLE_LOGIN_URL = window.GOOGLE_LOGIN_URL || '';
     const SITE             = window.SITE || {};
-    const billingPeriod    = window.PLAN_BILLING_PERIOD || 'year';
+
+    const IS_MONTHLY           = window.IS_MONTHLY;
+    const CHECKOUT_LABEL       = window.CHECKOUT_LABEL;
+    const BALANCE_LABEL        = window.BALANCE_LABEL;
+    const BILLING_PERIOD_LABEL = window.BILLING_PERIOD_LABEL || 'year';
 
     const djangoMessages = window.DJANGO_MESSAGES || [];
     const formErrors     = window.FORM_ERRORS || {};
 
+    // ---------- Helpers --------------------------------------------------
     const fmt = (num) => {
         if (isNaN(num)) return 'MWK 0';
         return new Intl.NumberFormat('en-MW', {
@@ -95,15 +139,23 @@
                 ? 'bg-red-50 text-red-700 border-red-200'
                 : 'bg-blue-50 text-blue-700 border-blue-200';
 
+        // Guests-only, and only when Google SSO is configured.
+        const showGoogleButton = !IS_AUTHENTICATED && GOOGLE_LOGIN_URL;
+
         return (
             <div className="min-h-screen bg-bg flex flex-col font-sans text-text">
+
                 <header className="bg-white border-b border-border px-4 py-4">
                     <div className="max-w-[1100px] mx-auto flex items-center">
-                        <img src={LOGO_URL} alt={SITE.name} className="h-[34px] object-contain" />
+                        <a href="/">
+                            <img src={LOGO_URL} alt={SITE.name} className="h-[34px] object-contain" />
+                        </a>
                     </div>
                 </header>
 
                 <main className="flex-grow max-w-[1100px] mx-auto w-full px-4 py-8 flex flex-col gap-8">
+
+                    {/* Progress indicator */}
                     <div className="flex items-center gap-3 md:gap-6 text-sm font-semibold text-brand">
                         <div className="flex items-center gap-2 opacity-50">
                             <span className="w-7 h-7 rounded-full bg-brand text-white flex items-center justify-center text-xs">1</span>
@@ -115,7 +167,7 @@
                         </div>
                         <div className="flex items-center gap-2 opacity-50">
                             <span className="w-7 h-7 rounded-full bg-gray-200 text-gray-500 flex items-center justify-center text-xs">3</span>
-                            Pay deposit
+                            {IS_MONTHLY ? 'Pay' : 'Pay deposit'}
                         </div>
                     </div>
 
@@ -138,7 +190,7 @@
                                 ))}
                             </AnimatePresence>
 
-                            {!IS_AUTHENTICATED && (
+                            {showGoogleButton && (
                                 <>
                                     <a
                                         href={GOOGLE_LOGIN_URL}
@@ -163,29 +215,54 @@
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                                 <div className="flex flex-col gap-1.5">
                                     <label className="text-sm font-semibold text-navy">Full name</label>
-                                    <input type="text" name="first_name" required className="border border-border rounded-lg p-3 focus:outline-none focus:border-brand" defaultValue={USER_DATA.first_name} />
+                                    <input
+                                        type="text"
+                                        name="first_name"
+                                        required
+                                        className="border border-border rounded-lg p-3 focus:outline-none focus:border-brand"
+                                        defaultValue={USER_DATA.first_name || ''}
+                                    />
                                 </div>
                                 <div className="flex flex-col gap-1.5">
                                     <label className="text-sm font-semibold text-navy">Phone number</label>
-                                    <input type="tel" name="phone_number" required className={`border rounded-lg p-3 focus:outline-none ${phoneError ? 'border-red-500 bg-red-50' : 'border-border focus:border-brand'}`} defaultValue={USER_DATA.phone_number} />
+                                    <input
+                                        type="tel"
+                                        name="phone_number"
+                                        required
+                                        className={`border rounded-lg p-3 focus:outline-none ${
+                                            phoneError ? 'border-red-500 bg-red-50' : 'border-border focus:border-brand'
+                                        }`}
+                                        defaultValue={USER_DATA.phone_number || ''}
+                                    />
                                     {phoneError && <span className="text-xs text-red-600">{phoneError}</span>}
                                 </div>
                                 <div className="flex flex-col gap-1.5">
                                     <label className="text-sm font-semibold text-navy">Email address</label>
                                     <input
-                                        type="email" name="email" required readOnly={IS_AUTHENTICATED}
+                                        type="email"
+                                        name="email"
+                                        required
+                                        readOnly={IS_AUTHENTICATED}
                                         className={`border rounded-lg p-3 focus:outline-none ${
-                                            emailError ? 'border-red-500 bg-red-50'
-                                            : IS_AUTHENTICATED ? 'border-border bg-gray-100 text-muted'
-                                            : 'border-border focus:border-brand'
+                                            emailError
+                                                ? 'border-red-500 bg-red-50'
+                                                : IS_AUTHENTICATED
+                                                    ? 'border-border bg-gray-100 text-muted'
+                                                    : 'border-border focus:border-brand'
                                         }`}
-                                        defaultValue={USER_DATA.email}
+                                        defaultValue={USER_DATA.email || ''}
                                     />
                                     {emailError && <span className="text-xs text-red-600">{emailError}</span>}
                                 </div>
                                 <div className="flex flex-col gap-1.5">
                                     <label className="text-sm font-semibold text-navy">Date of birth</label>
-                                    <input type="date" name="date_of_birth" required className="border border-border rounded-lg p-3 focus:outline-none focus:border-brand" defaultValue={USER_DATA.date_of_birth} />
+                                    <input
+                                        type="date"
+                                        name="date_of_birth"
+                                        required
+                                        className="border border-border rounded-lg p-3 focus:outline-none focus:border-brand"
+                                        defaultValue={USER_DATA.date_of_birth || ''}
+                                    />
                                 </div>
                             </div>
 
@@ -193,17 +270,33 @@
                                 <label className="text-sm font-semibold text-navy">Gender</label>
                                 <div className="flex gap-4">
                                     <label className="flex items-center gap-2 text-sm">
-                                        <input type="radio" name="gender" value="M" required defaultChecked={USER_DATA.gender === 'M' || !USER_DATA.gender} /> Male
+                                        <input
+                                            type="radio"
+                                            name="gender"
+                                            value="M"
+                                            required
+                                            defaultChecked={USER_DATA.gender === 'M' || !USER_DATA.gender}
+                                        /> Male
                                     </label>
                                     <label className="flex items-center gap-2 text-sm">
-                                        <input type="radio" name="gender" value="F" required defaultChecked={USER_DATA.gender === 'F'} /> Female
+                                        <input
+                                            type="radio"
+                                            name="gender"
+                                            value="F"
+                                            required
+                                            defaultChecked={USER_DATA.gender === 'F'}
+                                        /> Female
                                     </label>
                                 </div>
                             </div>
 
                             <div className="flex flex-col gap-1.5">
                                 <label className="text-sm font-semibold text-navy">Company (optional)</label>
-                                <input type="text" name="company_name" className="border border-border rounded-lg p-3 focus:outline-none focus:border-brand" />
+                                <input
+                                    type="text"
+                                    name="company_name"
+                                    className="border border-border rounded-lg p-3 focus:outline-none focus:border-brand"
+                                />
                             </div>
 
                             <h2 className="text-xl font-heading font-bold text-navy mt-4">Payment method</h2>
@@ -228,7 +321,6 @@
                                 </label>
                             </div>
 
-                            {/* ─── Terms acceptance with real legal links ───────────── */}
                             <label className="flex items-start gap-3 text-sm text-muted mt-2">
                                 <input type="checkbox" name="accept_terms" required className="mt-1" />
                                 <span>
@@ -245,8 +337,13 @@
                                 </span>
                             </label>
 
-                            <button type="submit" className="w-full bg-brand text-white font-semibold py-4 rounded-xl hover:bg-brand-hover transition-colors mt-2">
-                                Pay deposit {fmt(depositAmount)}
+                            <button
+                                type="submit"
+                                className="w-full bg-brand text-white font-semibold py-4 rounded-xl hover:bg-brand-hover transition-colors mt-2"
+                            >
+                                {IS_MONTHLY
+                                    ? `Pay ${fmt(checkoutAmount)}`
+                                    : `Pay deposit ${fmt(checkoutAmount)}`}
                             </button>
                         </div>
 
@@ -259,7 +356,8 @@
                             </div>
 
                             <p className="text-xs text-muted -mt-3">
-                                Billed {billingPeriod}. Includes hosting and email.
+                                Billed per {BILLING_PERIOD_LABEL}.
+                                {!IS_MONTHLY && ' 25% deposit starts work; balance invoiced at design approval.'}
                             </p>
 
                             <div className="flex flex-col gap-1.5">
@@ -273,13 +371,15 @@
 
                             <div className="border-t border-border pt-4 flex flex-col gap-2 text-sm">
                                 <div className="flex justify-between font-semibold text-brand">
-                                    <span>Deposit today (25%)</span>
-                                    <span>{fmt(depositAmount)}</span>
+                                    <span>{CHECKOUT_LABEL}</span>
+                                    <span>{fmt(checkoutAmount)}</span>
                                 </div>
-                                <div className="flex justify-between text-muted">
-                                    <span>Balance at design approval and launch</span>
-                                    <span>{fmt(balanceAmount)}</span>
-                                </div>
+                                {!IS_MONTHLY && BALANCE_LABEL && (
+                                    <div className="flex justify-between text-muted">
+                                        <span>{BALANCE_LABEL}</span>
+                                        <span>{fmt(balanceAmount)}</span>
+                                    </div>
+                                )}
                             </div>
                         </div>
                     </form>

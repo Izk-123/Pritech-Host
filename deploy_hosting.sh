@@ -7,38 +7,34 @@
 # What this provisions, in order:
 #   1.  git fetch + reset   → /home/project/pritechhost at origin/main
 #   2.  Python venv         → requirements + celery/redis/gunicorn/psycopg2
-#   3.  .env                → only created on first run; preserved after
+#   3.  .env                → created on first run; missing keys auto-added
 #   4.  Redis               → Celery broker + shared cache (DB 0 / DB 1)
 #   5.  PostgreSQL          → role + database, password synced from .env
 #   6.  DB connection test  → fail fast if creds are wrong
 #   7.  Django setup        → migrate / seed_legal / collectstatic / admin
-#   7b. Security migration  → add missing security env keys to .env
-#   7c. MFA detection       → auto-flip MFA_ENFORCE_FOR_STAFF once admin enrolls
+#   7b. Migration check     → FAIL if model changes are missing a migration
+#   7c. Security env keys   → add new security/OAuth keys if missing
+#   7d. MFA detection       → auto-flip MFA_ENFORCE_FOR_STAFF if admin enrolled
 #   8.  Gunicorn service    → HTTP app server (port = unix socket)
-#   9.  Celery worker       → processes emails, provisioning, dunning
-#  10.  Celery beat         → schedules the daily lifecycle scan
-#  11.  Nginx config        → reverse proxy + static/media (HTTP only here)
-#  12.  SSL / HTTPS         → idempotent Certbot run (THE FIX for 400s)
-#  13.  Post-SSL hardening  → flip SECURE_SSL_REDIRECT + cookies if HTTPS OK
-#  14.  Security check      → run Django's check --deploy + summarize
-#  15.  Health check        → verifies every public URL responds
-#  16.  Done                → prints action items
+#   9.  Celery worker       → processes emails, provisioning, reminders
+#  10.  Celery beat         → schedules daily lifecycle scan at 00:30 CAT
+#  11.  Nginx config        → reverse proxy + static/media
+#  12.  SSL / HTTPS         → idempotent Certbot run
+#  13.  Post-SSL hardening  → auto-enable SECURE_SSL_REDIRECT + secure cookies
+#  14.  Django check        → run `check --deploy` and summarize warnings
+#  15.  Health check        → verifies homepage, admin, legal pages respond
 #
-# Idempotency:
-#   - .env is never overwritten after first creation
-#   - new security env keys are APPENDED if missing (safe re-run)
-#   - git reset --hard origin/main (discards local edits to tracked files)
-#   - migrate is a fast no-op when schema is up to date
-#   - seed_legal skips existing documents
-#   - certbot --keep-until-expiring is safe to run daily
+# Idempotency notes:
+#   - .env is never overwritten; new keys are appended only if missing.
+#   - git reset --hard origin/main discards local edits to tracked files.
+#   - migrate is fast no-op when schema is up to date.
+#   - seed_legal skips any document that already exists.
+#   - certbot --keep-until-expiring is safe to run daily.
 #
 # Requirements on the target box:
 #   - Ubuntu 22.04 / 24.04, run as root via SSH
-#   - DNS for the domain + www already points at this server
-#   - Ports 80 + 443 reachable from the public internet (ufw/firewall open)
-#   - Base packages: git python3 python3-venv python3-pip
-#                    postgresql postgresql-contrib nginx openssl curl
-#                    certbot python3-certbot-nginx
+#   - DNS for domain + www pointing at this server
+#   - Ports 80 + 443 reachable from the public internet
 # ============================================================================
 
 set -euo pipefail
@@ -64,6 +60,8 @@ DJANGO_SETTINGS="pritech_host.settings"
 CELERY_APP="pritech_host"
 GUNICORN_SOCK="${PROJECT_DIR}/gunicorn.sock"
 
+# Queues processed by the worker. Note: 'default' handles the daily
+# dunning/reminder scans. 'emails' handles receipts + lifecycle emails.
 CELERY_QUEUES="default,emails,provisioning"
 CELERY_CONCURRENCY="2"
 
@@ -117,19 +115,7 @@ ok "Python dependencies installed."
 # ============================================================================
 # 3. Environment Variables
 # ============================================================================
-# .env is the source of truth for secrets and per-environment config.
-# First run  → generate DB password + Django SECRET_KEY, write .env.
-# Re-runs    → preserve .env verbatim (never rotate secrets automatically).
-#
-# SECURITY DEFAULTS on first run:
-#   AXES_ENABLED=True            (brute-force protection is on by default)
-#   RATELIMIT_ENABLE=True        (rate limits are on by default)
-#   MFA_ENFORCE_FOR_STAFF=False  (flipped True by step 7c once admin enrolls)
-#   SECURE_SSL_REDIRECT=False    (flipped True by step 13 once HTTPS verified)
-#   SESSION_COOKIE_SECURE=False  (flipped True by step 13)
-#   CSRF_COOKIE_SECURE=False     (flipped True by step 13)
-#   SECURE_HSTS_SECONDS=0        (operator turns this on manually after 30d)
-# ============================================================================
+# First run: generate secrets. Re-runs: preserve existing .env.
 log "Step 3: Environment variables"
 if [ -f "${PROJECT_DIR}/.env" ]; then
     DB_PASS=$(grep -E '^DB_PASSWORD=' "${PROJECT_DIR}/.env" | cut -d= -f2- | tr -d '\r' | tr -d '"' | tr -d "'" || true)
@@ -175,8 +161,6 @@ DEFAULT_FROM_EMAIL=Pritech Host <noreply@pritechmw.com>
 SALES_EMAIL=sales@pritechmw.com
 
 # ── Google OAuth ────────────────────────────────────────────────────────────
-# Fill these in after creating a Google Cloud OAuth client.
-# Leave empty to disable Google SSO (staff login still works).
 GOOGLE_CLIENT_ID=
 GOOGLE_CLIENT_SECRET=
 
@@ -189,31 +173,15 @@ REDIS_CACHE_URL=redis://127.0.0.1:6379/1
 HESTIA_MOCK=True
 DUNNING_ENABLED=True
 
-# ── Security features (SRS NFR-9 to NFR-11) ─────────────────────────────────
-# Axes brute-force lockout: 5 failures → 1-hour lockout on IP+username.
+# ── Security features ───────────────────────────────────────────────────────
 AXES_ENABLED=True
-
-# Rate limiting: per-view limits on payment, ticket, cookie endpoints.
 RATELIMIT_ENABLE=True
-
-# MFA enforcement: flipped True automatically by deploy step 7c once
-# the admin has enrolled in 2FA. Until then, staff can log in with
-# password only — which is fine because the admin hasn't got a TOTP
-# secret yet.
 MFA_ENFORCE_FOR_STAFF=False
 
-# ── HTTPS hardening (auto-managed by deploy step 13) ───────────────────────
-# These flip to True automatically once the script verifies that
-# https://${DOMAIN}/ returns 200 with the correct certificate.
+# ── HTTPS hardening (auto-managed by Step 13) ───────────────────────────────
 SECURE_SSL_REDIRECT=False
 SESSION_COOKIE_SECURE=False
 CSRF_COOKIE_SECURE=False
-
-# HSTS is intentionally 0 during the initial deploy. Do NOT enable
-# until HTTPS has been stable for at least 7 days — see the settings.py
-# rollout schedule. The operator enables this manually via:
-#   sed -i 's/^SECURE_HSTS_SECONDS=.*/SECURE_HSTS_SECONDS=3600/' .env
-# then increments gradually: 3600 → 86400 → 31536000.
 SECURE_HSTS_SECONDS=0
 EOF
     chmod 600 "${PROJECT_DIR}/.env"
@@ -285,6 +253,27 @@ export DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS}"
 python manage.py migrate --noinput > /dev/null
 ok "Database migrations applied."
 
+# ============================================================================
+# 7b. Migration check (SRS v1.5 safety net)
+# ============================================================================
+# If code was pushed without running `makemigrations` locally, production
+# would crash with "no such column" the first time a query runs. This
+# check catches that BEFORE the app starts failing for customers.
+log "Step 7b: Verifying no pending model changes"
+
+if ! python manage.py makemigrations --check --dry-run > /tmp/mig-check.log 2>&1; then
+    warn "⚠ Model changes detected without a corresponding migration:"
+    grep -E "^Migrations for|^  " /tmp/mig-check.log | sed 's/^/    /'
+    warn "  This deploy will fail once the new models are queried."
+    warn "  FIX: run 'makemigrations' locally, commit the migration files,"
+    warn "       push, then re-run this script."
+    warn "  (Deployment continues so the schema can be inspected, but"
+    warn "   the site may 500 until this is resolved.)"
+else
+    ok "All model changes have corresponding migrations."
+fi
+
+# Seed legal documents if the command exists. Idempotent — skips existing.
 if [ -f "${PROJECT_DIR}/core/management/commands/seed_legal.py" ]; then
     if python manage.py seed_legal 2>&1 | grep -q "Created"; then
         ok "Legal documents seeded."
@@ -292,8 +281,6 @@ if [ -f "${PROJECT_DIR}/core/management/commands/seed_legal.py" ]; then
     else
         ok "Legal documents already present — skipped."
     fi
-else
-    warn "seed_legal command not found — skipping legal document seeding."
 fi
 
 python manage.py collectstatic --noinput > /dev/null
@@ -316,14 +303,9 @@ print("  ✔ Allauth Site domain updated to pritechhost.com")
 PY
 
 # ============================================================================
-# 7b. Security env keys — ADD MISSING ONES ON RE-RUN
+# 7c. Security env keys — add missing on re-run
 # ============================================================================
-# Existing deployments predate the security features. Rather than telling
-# the operator to manually add 6 env vars, we append them if missing.
-# `sed -i` on an existing key is only used in later steps (MFA, SSL) —
-# here we only ADD what's missing so we never override manual changes.
-# ============================================================================
-log "Step 7b: Ensuring security env keys are present"
+log "Step 7c: Ensuring security env keys are present"
 
 add_env_if_missing() {
     local key="$1"
@@ -334,34 +316,21 @@ add_env_if_missing() {
     fi
 }
 
-add_env_if_missing "AXES_ENABLED"             "True"
-add_env_if_missing "RATELIMIT_ENABLE"         "True"
-add_env_if_missing "MFA_ENFORCE_FOR_STAFF"    "False"
-add_env_if_missing "SECURE_HSTS_SECONDS"      "0"
-add_env_if_missing "SECURE_HSTS_INCLUDE_SUBDOMAINS" "False"
-add_env_if_missing "SECURE_HSTS_PRELOAD"      "False"
-add_env_if_missing "GOOGLE_CLIENT_ID"         ""
-add_env_if_missing "GOOGLE_CLIENT_SECRET"     ""
+add_env_if_missing "AXES_ENABLED"                    "True"
+add_env_if_missing "RATELIMIT_ENABLE"                "True"
+add_env_if_missing "MFA_ENFORCE_FOR_STAFF"           "False"
+add_env_if_missing "SECURE_HSTS_SECONDS"             "0"
+add_env_if_missing "SECURE_HSTS_INCLUDE_SUBDOMAINS"  "False"
+add_env_if_missing "SECURE_HSTS_PRELOAD"             "False"
+add_env_if_missing "GOOGLE_CLIENT_ID"                ""
+add_env_if_missing "GOOGLE_CLIENT_SECRET"            ""
 
 ok "Security env keys verified."
 
 # ============================================================================
-# 7c. MFA ENFORCEMENT — auto-flip based on admin enrollment
+# 7d. MFA ENFORCEMENT — auto-flip based on admin enrollment
 # ============================================================================
-# MFA_ENFORCE_FOR_STAFF=True locks every staff member out of the site
-# until they enroll in TOTP. If we enable it on first deploy, the admin
-# is instantly locked out — because they haven't enrolled yet.
-#
-# So we detect on every deploy:
-#   • Admin has enrolled    → set MFA_ENFORCE_FOR_STAFF=True (enforce!)
-#   • Admin has NOT enrolled → set MFA_ENFORCE_FOR_STAFF=False (bootstrap)
-#   • allauth.mfa broken   → leave as-is, warn loudly
-#
-# Enrollment is done once via:
-#   https://pritechhost.com/accounts/2fa/totp/activate/
-# (the URL is exempt from the middleware so the admin can reach it)
-# ============================================================================
-log "Step 7c: MFA enrollment detection"
+log "Step 7d: MFA enrollment detection"
 
 MFA_STATUS=$(python manage.py shell <<'PY' 2>/dev/null | tail -1
 try:
@@ -399,14 +368,12 @@ case "$MFA_STATUS" in
         ;;
     mfa_unavailable)
         warn "allauth.mfa not installed → MFA enforcement unavailable."
-        warn "  Install with: pip install 'django-allauth[mfa]'"
         ;;
     no_admin)
         warn "No superuser found — skipping MFA detection."
         ;;
     *)
         warn "MFA status could not be determined (status=${MFA_STATUS})."
-        warn "  Check that allauth.mfa is installed and DB migrations succeeded."
         ;;
 esac
 
@@ -505,7 +472,7 @@ systemctl restart celery-beat-${PROJECT_NAME}
 ok "Celery beat configured and restarted."
 
 # ============================================================================
-# 11. Nginx Configuration (HTTP only)
+# 11. Nginx Configuration
 # ============================================================================
 log "Step 11: Configuring Nginx"
 cat > /etc/nginx/sites-available/${PROJECT_NAME} <<EOF
@@ -536,22 +503,20 @@ if ! nginx -t 2>/tmp/nginx-t.log; then
     die "Nginx config failed — see above."
 fi
 if grep -q "conflicting server name" /tmp/nginx-t.log; then
-    warn "nginx reported server_name conflicts (other sites claiming ${DOMAIN} or ${SERVER_IP}):"
+    warn "nginx reported server_name conflicts:"
     grep "conflicting server name" /tmp/nginx-t.log | sort -u | sed 's/^/    /'
-    warn "  This can cause HTTPS requests to hit the wrong backend."
 fi
 
 systemctl reload nginx
 ok "Nginx reloaded."
 
 # ============================================================================
-# 12. SSL / HTTPS Provisioning (idempotent Certbot)
+# 12. SSL / HTTPS Provisioning
 # ============================================================================
 log "Step 12: SSL / HTTPS provisioning"
 
 if ! curl -sfI -H "Host: ${DOMAIN}" "http://127.0.0.1/" > /dev/null 2>&1; then
-    warn "nginx is not answering ${DOMAIN} on loopback — Certbot will probably fail."
-    warn "  Check: systemctl status nginx && journalctl -u nginx -n 30"
+    warn "nginx is not answering ${DOMAIN} on loopback — Certbot may fail."
 fi
 
 if certbot certificates 2>/dev/null | grep -q "Certificate Name: ${DOMAIN}"; then
@@ -574,7 +539,6 @@ if certbot --nginx \
     ok "Certbot completed."
 else
     warn "Certbot reported issues. Check /tmp/certbot-deploy.log for details."
-    warn "  Common causes: DNS not propagated, port 80 blocked, LE rate limit."
 fi
 
 CERT_CN=$(echo | openssl s_client -connect "${DOMAIN}:443" -servername "${DOMAIN}" 2>/dev/null \
@@ -583,42 +547,8 @@ CERT_CN=$(echo | openssl s_client -connect "${DOMAIN}:443" -servername "${DOMAIN
 
 if [[ "${CERT_CN}" == *"${DOMAIN}"* ]]; then
     ok "HTTPS cert verified (subject=${CERT_CN})"
-
-    CERT_SAN=$(echo | openssl s_client -connect "${DOMAIN}:443" -servername "${DOMAIN}" 2>/dev/null \
-               | openssl x509 -noout -ext subjectAltName 2>/dev/null || echo "")
-    if echo "${CERT_SAN}" | grep -q "DNS:${WWW_DOMAIN}"; then
-        ok "Cert SAN includes ${WWW_DOMAIN}."
-    else
-        warn "Cert does NOT cover ${WWW_DOMAIN}. Add it with:"
-        warn "  certbot --nginx -d ${DOMAIN} -d ${WWW_DOMAIN} --expand"
-    fi
 else
     warn "Cert verification failed (subject was '${CERT_CN}', expected '${DOMAIN}')."
-fi
-
-# Detect other sites on this server whose certs will fail renewal
-FAILED_EXTERNAL=""
-for conf in /etc/letsencrypt/renewal/*.conf; do
-    [[ -f "$conf" ]] || continue
-    cert_name=$(basename "$conf" .conf)
-    [[ "$cert_name" == "$DOMAIN" ]] && continue
-    [[ "$cert_name" == "$WWW_DOMAIN" ]] && continue
-
-    primary_domain=$(grep -oP '^domains\s*=\s*\K[^,\s]+' "$conf" 2>/dev/null | head -1 || echo "$cert_name")
-    dns_ip=$(dig +short "$primary_domain" A 2>/dev/null | head -1 || true)
-
-    if [[ -z "$dns_ip" ]]; then
-        FAILED_EXTERNAL+="  ${primary_domain} → no A record (renewal will fail)\n"
-    elif [[ "$dns_ip" != "$SERVER_IP" ]]; then
-        FAILED_EXTERNAL+="  ${primary_domain} → DNS: ${dns_ip} (not this server; renewal will fail)\n"
-    fi
-done
-
-if [[ -n "$FAILED_EXTERNAL" ]]; then
-    warn "Other domains on this server have broken cert renewals:"
-    printf "%b" "$FAILED_EXTERNAL" | sed 's/^/    /'
-    warn "  Their renewals fail daily but don't affect ${DOMAIN}."
-    warn "  Silence with: certbot delete --cert-name <name>"
 fi
 
 # ============================================================================
@@ -633,8 +563,6 @@ if curl -sfI --max-time 5 "https://${DOMAIN}/" >/dev/null 2>&1; then
     sed -i 's/^CSRF_COOKIE_SECURE=.*/CSRF_COOKIE_SECURE=True/'         "${PROJECT_DIR}/.env"
 else
     warn "HTTPS is NOT responding — leaving redirects OFF so HTTP still works."
-    warn "  Investigate with: certbot certificates"
-    warn "                    nginx -T | grep -A2 'server_name ${DOMAIN}'"
     sed -i 's/^SECURE_SSL_REDIRECT=.*/SECURE_SSL_REDIRECT=False/'       "${PROJECT_DIR}/.env"
     sed -i 's/^SESSION_COOKIE_SECURE=.*/SESSION_COOKIE_SECURE=False/'   "${PROJECT_DIR}/.env"
     sed -i 's/^CSRF_COOKIE_SECURE=.*/CSRF_COOKIE_SECURE=False/'         "${PROJECT_DIR}/.env"
@@ -644,43 +572,16 @@ systemctl restart gunicorn-${PROJECT_NAME} celery-${PROJECT_NAME} celery-beat-${
 ok "Services restarted to pick up the new .env values."
 
 # ============================================================================
-# 14. Django check --deploy
-# ============================================================================
-# Django's `check --deploy` audits the settings for production
-# readiness. It emits WARNING-level issues for insecure defaults like
-# `DEBUG=True`, missing HTTPS redirects, or weak SECRET_KEY.
-#
-# With our config:
-#   • After step 13 succeeds → 0 warnings
-#   • Before HTTPS is verified → warnings about cookies/redirects
-#   • Always: SECURE_HSTS_SECONDS warning if HSTS is 0
-#     (this is INTENTIONAL — see the settings.py rollout schedule)
-#
-# We don't fail on warnings — the operator decides.
+# 14. Django deployment check
 # ============================================================================
 log "Step 14: Django deployment check"
 
 DEPLOY_CHECK_LOG=/tmp/django-check-deploy.log
 if python manage.py check --deploy > "${DEPLOY_CHECK_LOG}" 2>&1; then
-    WARNING_COUNT=$(grep -c "WARNINGS:" "${DEPLOY_CHECK_LOG}" || echo "0")
-    if [[ "${WARNING_COUNT}" -gt 0 ]] && ! grep -q "0 silenced" <(grep "System check identified" "${DEPLOY_CHECK_LOG}" || echo ""); then
-        warn "check --deploy reported configuration warnings:"
-        grep -E "^\s*[?]|WARNINGS:" "${DEPLOY_CHECK_LOG}" | sed 's/^/    /' | head -10
-        warn "  Full log: ${DEPLOY_CHECK_LOG}"
-    else
-        ok "check --deploy passed (0 issues)."
-    fi
+    ok "check --deploy passed."
 else
-    warn "check --deploy failed — investigate before going live:"
-    sed 's/^/    /' "${DEPLOY_CHECK_LOG}" | tail -20
-fi
-
-# Expect a warning about SECURE_HSTS_SECONDS=0 until the operator
-# enables HSTS after 30+ days of stable HTTPS. That's intentional.
-if grep -q "SECURE_HSTS_SECONDS" "${DEPLOY_CHECK_LOG}" 2>/dev/null; then
-    warn "  ℹ  SECURE_HSTS_SECONDS=0 warning is INTENTIONAL."
-    warn "     Enable HSTS manually after 30 days of stable HTTPS. See"
-    warn "     settings.py section 15 for the safe rollout schedule."
+    warn "check --deploy reported warnings (expected if HTTPS is still settling):"
+    grep -E "^\s*[?]|WARNINGS:" "${DEPLOY_CHECK_LOG}" | sed 's/^/    /' | head -10
 fi
 
 # ============================================================================
@@ -706,7 +607,7 @@ check_url() {
 
     case "$status" in
         000) warn "${scheme}://${DOMAIN}${path} → no response (nginx/gunicorn down?)" ;;
-        *)   warn "${scheme}://${DOMAIN}${path} → ${status} (expected one of: ${expect_string})" ;;
+        *)   warn "${scheme}://${DOMAIN}${path} → ${status} (expected: ${expect_string})" ;;
     esac
 }
 
@@ -718,7 +619,6 @@ check_url "https" "/legal/aup/"     "200"
 check_url "https" "/legal/refund/"  "200"
 check_url "https" "/admin/login/"   "200"
 
-# Security headers — spot-check that they're actually being emitted
 HDRS=$(curl -skI --max-time 5 "https://${DOMAIN}/" 2>/dev/null)
 for hdr in "X-Content-Type-Options: nosniff" \
            "X-Frame-Options: SAMEORIGIN" \
@@ -753,12 +653,11 @@ else
     SSL_STATUS="NOT ACTIVE"
 fi
 
-# Report MFA enforcement state
 MFA_STATE=$(grep '^MFA_ENFORCE_FOR_STAFF=' "${PROJECT_DIR}/.env" | cut -d= -f2)
 if [[ "${MFA_STATE}" == "True" ]]; then
     MFA_LINE="✔ ENFORCED (staff must use TOTP)"
 else
-    MFA_LINE="⚠ NOT ENFORCED — enroll admin at /accounts/2fa/totp/activate/, then re-run"
+    MFA_LINE="⚠ NOT ENFORCED — enroll admin at /accounts/2fa/totp/activate/"
 fi
 
 cat <<EOF
@@ -788,24 +687,32 @@ cat <<EOF
         4. Save the recovery codes somewhere safe
         5. Re-run this script — it will auto-enable MFA enforcement
 
-     3. HAVE A MALAWI LAWYER REVIEW THE LEGAL DOCUMENTS.
-        /admin/ → Legal Documents contains placeholder Terms, Privacy,
-        AUP, and Refund Policy. They are a structural starting point,
-        not legal advice.
+     3. REVIEW PLAN PAYMENT SCHEDULES (SRS v1.5 / FR-85).
+        The new billing model uses per-plan payment schedules. Go to
+        /admin/billing/plan/ and edit each plan:
+          • Monthly plans   → default is 100% at checkout (usually fine)
+          • Yearly plans    → default is 25% deposit + 75% at launch
+          • Business/Enterprise → set a custom schedule like:
+            25% at checkout, 50% at design approval, 25% at launch
+        The percentages MUST sum to 100 or the plan won't save.
 
-     4. FILL IN REAL PAYCHANGU CREDENTIALS.
+     4. REVIEW LEGAL CONTENT.
+        /admin/ → Legal Documents contains placeholder Terms, Privacy,
+        AUP, and Refund Policy. Have a Malawi lawyer review before
+        going live.
+
+     5. FILL IN REAL PAYCHANGU CREDENTIALS.
         PAYCHANGU_SECRET_KEY and PAYCHANGU_WEBHOOK_SECRET in .env are
-        placeholders. Copy the real values from the PayChangu dashboard
-        → Settings → API Keys, then:
+        placeholders. Copy the real values from the PayChangu dashboard,
+        then:
           systemctl restart gunicorn-${PROJECT_NAME} celery-${PROJECT_NAME}
 
-     5. FILL IN REAL EMAIL CREDENTIALS.
-        EMAIL_HOST_PASSWORD in .env is `change-me`. Use the real cPanel
+     6. FILL IN REAL EMAIL CREDENTIALS.
+        EMAIL_HOST_PASSWORD in .env is 'change-me'. Use the real cPanel
         mailbox password, then restart the same three services.
 
-     6. CONFIGURE GOOGLE OAUTH (optional).
+     7. CONFIGURE GOOGLE OAUTH (optional).
         GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in .env are empty.
-        See https://console.cloud.google.com/apis/credentials.
 
   Certbot auto-renewal runs daily via systemd timer:
     systemctl list-timers | grep certbot

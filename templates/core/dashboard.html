@@ -32,14 +32,12 @@
     }).format(num || 0);
 
     // ==================================================================
-    // Reusable primitives
+    // Primitives
     // ==================================================================
     const Skeleton = ({ className }) => (
         <div className={`animate-pulse bg-gray-200 rounded-lg ${className}`} />
     );
 
-    // Modal now takes an optional maxWidth so we can render the
-    // ticket thread wider than the standard small modal.
     const Modal = ({ isOpen, onClose, title, children, maxWidth = 'max-w-md' }) => {
         if (!isOpen) return null;
         return (
@@ -71,7 +69,6 @@
         );
     };
 
-    // Now supports the three ticket statuses introduced with FR-46.
     const TicketStatusBadge = ({ status, label }) => {
         const styles = {
             open:              'bg-yellow-100 text-yellow-700',
@@ -176,6 +173,168 @@
     };
 
     // ==================================================================
+    // NEW: Balance card (FR-89)
+    //
+    // Shows the full payment schedule for a subscription that has
+    // more than one instalment. Each row reflects its status:
+    //   • paid      → green, "Paid"
+    //   • issued    → yellow, "Due DATE", included in the header CTA
+    //   • scheduled → grey, "Locked · Trigger"
+    //
+    // A subscription with `is_fully_paid=true` shows a green "Fully paid"
+    // badge instead of the card (matches the SRS wording).
+    // ==================================================================
+    const TRIGGER_LABELS = {
+        checkout:        'At checkout',
+        content:         'When content received',
+        design_approval: 'On design approval',
+        launch:          'Before launch',
+    };
+
+    const BalanceCard = ({ balance, upcoming, isPaying, onPayNow }) => {
+        if (!balance) return null;
+
+        // Fully-paid badge (FR-89: "Fully paid")
+        if (balance.is_fully_paid) {
+            return (
+                <div className="bg-green-50 border border-green-200 rounded-[18px] p-4 flex items-center gap-3">
+                    <span className="text-2xl">✅</span>
+                    <div>
+                        <p className="font-bold text-green-800">Fully paid</p>
+                        <p className="text-sm text-green-700">
+                            Your {fmt(balance.contract_total)} contract is settled.
+                        </p>
+                    </div>
+                </div>
+            );
+        }
+
+        // Nothing scheduled and nothing due → shouldn't normally happen,
+        // but hide the card rather than show a broken state.
+        if (!upcoming || upcoming.length === 0) return null;
+
+        const next = balance.next_instalment;
+        const canPayNext = next && next.invoice_id && next.status === 'issued';
+
+        return (
+            <motion.div
+                initial={{ opacity: 0, y: -10 }}
+                animate={{ opacity: 1, y: 0 }}
+                className="bg-white border-2 border-yellow-300 rounded-[18px] p-6 shadow-sm"
+            >
+                {/* Header: remaining + Pay CTA */}
+                <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-4 mb-4">
+                    <div>
+                        <p className="text-xs font-bold uppercase tracking-wide text-yellow-700 mb-1">
+                            Remaining balance
+                        </p>
+                        <h2 className="text-2xl md:text-3xl font-heading font-bold text-navy">
+                            {fmt(balance.remaining)}
+                        </h2>
+                        <p className="text-sm text-muted mt-1">
+                            Paid {fmt(balance.amount_paid)} of {fmt(balance.contract_total)}
+                            {' '}· {balance.paid_pct}% complete
+                        </p>
+                    </div>
+                    {canPayNext ? (
+                        <button
+                            onClick={() => onPayNow(next.invoice_id)}
+                            disabled={isPaying}
+                            className="bg-brand text-white font-semibold px-6 py-3 rounded-xl hover:bg-brand-hover disabled:opacity-50 whitespace-nowrap w-full md:w-auto"
+                        >
+                            {isPaying
+                                ? 'Processing…'
+                                : `Pay ${next.label} · ${fmt(next.amount)}`}
+                        </button>
+                    ) : (
+                        <p className="text-xs text-muted max-w-[260px]">
+                            {next?.status === 'scheduled'
+                                ? `Next: ${next.label} — issued when ${(TRIGGER_LABELS[next.trigger] || next.trigger).toLowerCase()}.`
+                                : 'No instalment currently due.'}
+                        </p>
+                    )}
+                </div>
+
+                {/* Progress bar */}
+                <div className="mb-5">
+                    <div className="h-2 w-full bg-gray-200 rounded-full overflow-hidden">
+                        <div
+                            className="h-full bg-brand rounded-full transition-all duration-500"
+                            style={{ width: `${balance.paid_pct}%` }}
+                        />
+                    </div>
+                </div>
+
+                {/* Schedule list */}
+                <div>
+                    <p className="text-xs font-bold uppercase tracking-wide text-muted mb-2">
+                        Payment schedule
+                    </p>
+                    <div className="flex flex-col gap-1">
+                        {upcoming.map((inst) => {
+                            const isPaid   = inst.status === 'paid';
+                            const isIssued = inst.status === 'issued';
+                            const isLocked = inst.status === 'scheduled';
+
+                            const statusLine = isPaid
+                                ? 'Paid'
+                                : isIssued
+                                    ? `Due ${inst.due_date || 'today'}`
+                                    : `Locked · ${TRIGGER_LABELS[inst.trigger] || inst.trigger}`;
+
+                            return (
+                                <div
+                                    key={inst.sequence}
+                                    className={`flex items-center justify-between gap-3 p-3 rounded-lg ${
+                                        isPaid    ? 'bg-green-50'
+                                        : isIssued ? 'bg-yellow-50 border border-yellow-200'
+                                        :            'bg-gray-50'
+                                    }`}
+                                >
+                                    <div className="flex items-center gap-3 flex-1 min-w-0">
+                                        <div className={`w-6 h-6 rounded-full flex items-center justify-center flex-shrink-0 text-xs font-bold ${
+                                            isPaid    ? 'bg-green-500 text-white'
+                                            : isIssued ? 'bg-yellow-500 text-white'
+                                            :            'bg-gray-300 text-gray-600'
+                                        }`}>
+                                            {isPaid ? '✓' : inst.sequence}
+                                        </div>
+                                        <div className="min-w-0">
+                                            <p className="font-semibold text-sm text-navy truncate">
+                                                {inst.label}
+                                            </p>
+                                            <p className="text-xs text-muted truncate">
+                                                {statusLine}
+                                            </p>
+                                        </div>
+                                    </div>
+                                    <div className="text-right flex-shrink-0">
+                                        <p className="font-semibold text-sm text-navy">
+                                            {fmt(inst.amount)}
+                                        </p>
+                                        <p className="text-xs text-muted">
+                                            {inst.percentage}%
+                                        </p>
+                                    </div>
+                                    {isIssued && inst.invoice_id && (
+                                        <button
+                                            onClick={() => onPayNow(inst.invoice_id)}
+                                            disabled={isPaying}
+                                            className="ml-2 bg-brand text-white text-xs font-semibold px-3 py-1.5 rounded-lg hover:bg-brand-hover disabled:opacity-50 flex-shrink-0"
+                                        >
+                                            Pay
+                                        </button>
+                                    )}
+                                </div>
+                            );
+                        })}
+                    </div>
+                </div>
+            </motion.div>
+        );
+    };
+
+    // ==================================================================
     // Project timeline (unchanged)
     // ==================================================================
     const ProjectTimeline = ({ currentStage }) => {
@@ -256,9 +415,8 @@
         const [isPaying, setIsPaying]         = useState(false);
         const [ticketData, setTicketData]     = useState({ subject: '', message: '' });
 
-        // ─── Ticket thread modal state (SRS FR-46) ─────────────────────
-        const [openTicketId, setOpenTicketId] = useState(null);
-        const [ticketThread, setTicketThread] = useState(null);
+        const [openTicketId, setOpenTicketId]   = useState(null);
+        const [ticketThread, setTicketThread]   = useState(null);
         const [ticketLoading, setTicketLoading] = useState(false);
         const [replyMessage, setReplyMessage]   = useState('');
         const [sendingReply, setSendingReply]   = useState(false);
@@ -337,9 +495,6 @@
             });
         };
 
-        // ─── Open ticket thread ───────────────────────────────────────
-        // Marks staff replies as read on the server (side effect of GET).
-        // Then refreshes the dashboard so the unread badge clears.
         const openTicket = (ticketId) => {
             setOpenTicketId(ticketId);
             setTicketThread(null);
@@ -356,7 +511,7 @@
                         setTicketThread(d);
                     }
                     setTicketLoading(false);
-                    fetchData();   // clears the unread badge
+                    fetchData();
                 })
                 .catch(() => {
                     setTicketLoading(false);
@@ -364,9 +519,6 @@
                 });
         };
 
-        // ─── Send a customer reply ────────────────────────────────────
-        // On success: append the reply locally (instant feedback) and
-        // refresh dashboard state (status may have flipped to 'open').
         const handleSendReply = (e) => {
             e.preventDefault();
             if (!replyMessage.trim() || !openTicketId) return;
@@ -465,7 +617,6 @@
                 <main className="flex-1 h-full overflow-y-auto bg-bg relative">
                     <div className="p-4 md:p-8 flex flex-col gap-6 w-full max-w-[1200px] mx-auto pb-24 md:pb-8">
 
-                        {/* Success banner */}
                         {showSuccessBanner && (
                             <motion.div
                                 initial={{ opacity: 0, y: -20 }} animate={{ opacity: 1, y: 0 }}
@@ -481,7 +632,6 @@
                             </motion.div>
                         )}
 
-                        {/* Greeting */}
                         <div>
                             <h1 className="text-xl md:text-2xl font-heading font-bold text-navy">
                                 Welcome back, {data.user_name}
@@ -491,11 +641,17 @@
                             </p>
                         </div>
 
-                        {/* Renewal banner */}
                         <RenewalBanner renewal={data.renewal} onPayNow={handlePayNow} />
 
-                        {/* Project timeline */}
                         {data.project && <ProjectTimeline currentStage={data.project.stage} />}
+
+                        {/* ────────── NEW: FULL BALANCE CARD (FR-89) ────────── */}
+                        <BalanceCard
+                            balance={data.balance}
+                            upcoming={data.upcoming_instalments}
+                            isPaying={isPaying}
+                            onPayNow={handlePayNow}
+                        />
 
                         {/* Package / Hosting / Usage */}
                         <div className="grid grid-cols-1 md:grid-cols-3 gap-4 md:gap-6">
@@ -608,7 +764,7 @@
                             </div>
                         </div>
 
-                        {/* ============ SUPPORT TICKETS (clickable) ============ */}
+                        {/* Support tickets */}
                         <div className="bg-white border border-border rounded-[18px] p-6 shadow-sm">
                             <div className="flex justify-between items-center mb-4">
                                 <h2 className="text-lg font-heading font-bold text-navy">Support Tickets</h2>
@@ -703,7 +859,7 @@
                     </a>
                 </div>
 
-                {/* ============ Create-ticket modal (unchanged) ============ */}
+                {/* Create-ticket modal */}
                 <Modal isOpen={isTicketOpen} onClose={() => setIsTicketOpen(false)} title="Open a Support Ticket">
                     <form onSubmit={handleCreateTicket} className="flex flex-col gap-4">
                         <div>
@@ -726,7 +882,7 @@
                     </form>
                 </Modal>
 
-                {/* ============ Ticket thread modal (SRS FR-46) ============ */}
+                {/* Ticket thread modal */}
                 <Modal
                     isOpen={!!openTicketId}
                     onClose={() => { setOpenTicketId(null); setTicketThread(null); }}
@@ -743,7 +899,6 @@
 
                     {ticketThread && !ticketLoading && (
                         <div className="flex flex-col gap-4">
-                            {/* Status line */}
                             <div className="flex items-center justify-between text-xs text-muted">
                                 <span>Opened {ticketThread.ticket.created_at}</span>
                                 <TicketStatusBadge
@@ -752,9 +907,7 @@
                                 />
                             </div>
 
-                            {/* Thread scroll area */}
                             <div className="flex flex-col gap-3 max-h-[400px] overflow-y-auto pr-1">
-                                {/* Original customer message */}
                                 <div className="bg-gray-50 rounded-xl p-3">
                                     <div className="flex justify-between mb-1">
                                         <span className="text-xs font-bold text-navy">You</span>
@@ -763,7 +916,6 @@
                                     <p className="text-sm text-text whitespace-pre-wrap">{ticketThread.ticket.message}</p>
                                 </div>
 
-                                {/* Replies in chronological order */}
                                 {ticketThread.replies.map((r) => (
                                     <div key={r.id}
                                         className={`rounded-xl p-3 ${
@@ -782,7 +934,6 @@
                                 ))}
                             </div>
 
-                            {/* Reply form or closed notice */}
                             {ticketThread.ticket.status !== 'closed' ? (
                                 <form onSubmit={handleSendReply} className="flex flex-col gap-2 border-t pt-3">
                                     <textarea

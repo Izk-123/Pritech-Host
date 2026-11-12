@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html>
+<body style="font-family: Arial, sans-serif; background:#F7FAFD; padding:20px; margin:0;">
+  <div style="max-width:600px; margin:0 auto; background:#fff; border-radius:12px; border:1px solid #E1EAF2;">
+    <div style="background:#16365F; padding:20px; text-align:center;">
+      <h1 style="color:#fff; margin:0; font-size:22px;">Pritech Host</h1>
+    </div>
+    <div style="padding:30px;">
+      <h2 style="color:#16365F; margin-top:0;">Invoice ready: {{ instalment_label }}</h2>
+      <p style="color:#5B6B7C; font-size:16px; line-height:1.5;">
+        Hi {{ customer_name }},<br><br>
+        The next instalment for your <strong>{{ plan_name }}</strong> project is now due.
+      </p>
+      <div style="background:#F7FAFD; border:1px solid #E1EAF2; border-radius:8px; padding:16px; margin:20px 0;">
+        <p style="margin:4px 0;"><strong>Invoice:</strong> {{ invoice_number }}</p>
+        <p style="margin:4px 0;"><strong>Amount:</strong> MWK {{ amount|floatformat:"0" }}</p>
+        <p style="margin:4px 0;"><strong>Due:</strong> {{ due_date }}</p>
+      </div>
+      <div style="text-align:center; margin-top:25px;">
+        <a href="{{ pay_url }}" style="background:#1478C4; color:#fff; padding:12px 28px; border-radius:8px; font-weight:bold; text-decoration:none; display:inline-block;">
+          Pay Now
+        </a>
+      </div>
+    </div>
+    <div style="background:#F7FAFD; padding:15px; text-align:center; color:#9CA3AF; font-size:12px;">
+      &copy; 2026 Pritech ICT Solutions · info@pritechmw.com
+    </div>
+  </div>
+</body>
+</html>

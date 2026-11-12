@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html>
+<body style="font-family: Arial, sans-serif; background:#F7FAFD; padding:20px; margin:0;">
+  <div style="max-width:600px; margin:0 auto; background:#fff; border-radius:12px; overflow:hidden; border:1px solid #E1EAF2;">
+    <div style="background:#B45309; padding:20px; text-align:center;">
+      <h1 style="color:#fff; margin:0; font-size:22px;">Outstanding Balance Reminder</h1>
+    </div>
+    <div style="padding:30px;">
+      <p style="color:#5B6B7C; font-size:16px; line-height:1.5;">
+        Hi {{ customer_name }},<br><br>
+        Just a friendly reminder that you have an outstanding balance on your
+        <strong>{{ plan_name }}</strong> plan.
+      </p>
+
+      <div style="background:#FEF3C7; border:1px solid #FDE68A; border-radius:8px; padding:20px; margin:20px 0;">
+        <p style="margin:0 0 8px; color:#78350F; font-size:14px;">
+          <strong>Contract total:</strong> MWK {{ contract_total|floatformat:"0" }}
+        </p>
+        <p style="margin:0 0 8px; color:#78350F; font-size:14px;">
+          <strong>Paid:</strong> MWK {{ amount_paid|floatformat:"0" }} ({{ paid_pct }}%)
+        </p>
+        <p style="margin:0; color:#78350F; font-size:18px; font-weight:bold;">
+          <strong>Remaining:</strong> MWK {{ remaining|floatformat:"0" }}
+        </p>
+      </div>
+
+      {% if invoice_number %}
+      <p style="color:#5B6B7C; font-size:14px;">
+        Invoice <strong>{{ invoice_number }}</strong> is ready and can be paid from your dashboard.
+      </p>
+      {% endif %}
+
+      <div style="text-align:center; margin-top:25px;">
+        <a href="{{ pay_url }}" style="background:#B45309; color:#fff; padding:12px 28px; border-radius:8px; font-weight:bold; text-decoration:none; display:inline-block;">
+          Pay Remaining Balance
+        </a>
+      </div>
+      <p style="color:#9CA3AF; font-size:12px; margin-top:20px; text-align:center;">
+        We'll remind you monthly until the balance is fully paid. Reply to this
+        email if you need a payment plan.
+      </p>
+    </div>
+    <div style="background:#F7FAFD; padding:15px; text-align:center; color:#9CA3AF; font-size:12px;">
+      &copy; 2026 Pritech ICT Solutions · info@pritechmw.com
+    </div>
+  </div>
+</body>
+</html>
